@@ -51,7 +51,16 @@ class MusicApp:
         await self.disconnect()
         self.transport = BleTransport(address, name)
         self.transport.use_response = not self.settings.fast_mode
-        await self.transport.connect()
+        self.transport.on_status = lambda message: self._log("info", message)
+        try:
+            await self.transport.connect()
+        except Exception as exc:  # noqa: BLE001 - bleak raises many backend errors
+            raise SessionError(
+                f"无法连接手表：{exc}\n"
+                "请检查：① 手机上的华为运动健康已断开/解除配对；"
+                "② 手表没有停在「连接新手机」的二维码界面；"
+                "③ Windows「设置 → 蓝牙和其他设备」里已成功配对这块手表。"
+            ) from exc
         self.transport.on_disconnect(lambda: self._on_event("disconnected", {}))
         self.session = HuaweiSession(
             self.transport,

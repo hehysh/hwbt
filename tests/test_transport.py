@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from hwmusic.transport import BleTransport, _looks_like_huawei
+import pytest
+from bleak.exc import BleakError
+
+from hwmusic.transport import BleTransport, _is_auth_error, _looks_like_huawei
 
 
 class _FakeClient:
@@ -35,3 +38,75 @@ def test_minimum_mtu_keeps_default_slice_size() -> None:
     transport._client = _FakeClient(23)  # type: ignore[assignment]
     transport._apply_mtu()
     assert transport.max_write_size == 244
+
+
+def test_auth_error_detection() -> None:
+    assert _is_auth_error(Exception("Insufficient authentication"))
+    assert _is_auth_error(Exception("GATT protocol error 0x05"))
+    assert _is_auth_error(Exception("WinError 0x80070005"))
+    assert _is_auth_error(Exception("Write not permitted"))
+    assert not _is_auth_error(Exception("Characteristic not found"))
+
+
+class _PairingClient:
+    def __init__(self, result: bool = True, error: Exception | None = None) -> None:
+        self.result = result
+        self.error = error
+        self.paired = 0
+
+    async def pair(self) -> bool:
+        self.paired += 1
+        if self.error is not None:
+            raise self.error
+        return self.result
+
+
+@pytest.mark.asyncio
+async def test_recover_auth_ignores_unrelated_errors() -> None:
+    transport = BleTransport("AA:BB")
+    client = _PairingClient()
+    transport._client = client  # type: ignore[assignment]
+    assert await transport._recover_auth(Exception("Characteristic not found")) is False
+    assert client.paired == 0
+
+
+@pytest.mark.asyncio
+async def test_recover_auth_pairs_when_asked() -> None:
+    transport = BleTransport("AA:BB")
+    client = _PairingClient()
+    transport._client = client  # type: ignore[assignment]
+    assert await transport._recover_auth(Exception("Insufficient encryption")) is True
+    assert client.paired == 1
+
+
+@pytest.mark.asyncio
+async def test_recover_auth_survives_pairing_failure() -> None:
+    transport = BleTransport("AA:BB")
+    client = _PairingClient(error=RuntimeError("user cancelled"))
+    transport._client = client  # type: ignore[assignment]
+    assert await transport._recover_auth(Exception("Insufficient encryption")) is False
+
+
+class _NotifyClient:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.paired = False
+
+    async def start_notify(self, _uuid: str, _callback) -> None:
+        self.calls += 1
+        if self.calls == 1:
+            raise BleakError("Insufficient authentication")
+
+    async def pair(self) -> bool:
+        self.paired = True
+        return True
+
+
+@pytest.mark.asyncio
+async def test_start_notify_pairs_then_retries() -> None:
+    transport = BleTransport("AA:BB")
+    client = _NotifyClient()
+    transport._client = client  # type: ignore[assignment]
+    await transport.start_notify(lambda _data: None)
+    assert client.paired is True
+    assert client.calls == 2

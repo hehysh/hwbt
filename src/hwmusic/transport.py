@@ -19,6 +19,24 @@ class SliceTooLarge(Exception):
     """The negotiated ATT MTU cannot carry our frame; shrink and retry."""
 
 
+# Windows/BlueZ report these when a GATT operation needs an OS-level bond.
+_AUTH_ERROR_TOKENS = (
+    "insufficient",
+    "authenticat",
+    "encrypt",
+    "not permitted",
+    "not authorized",
+    "0x80070005",
+    "protocol error 0x05",
+    "protocol error 0x0f",
+)
+
+
+def _is_auth_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(token in message for token in _AUTH_ERROR_TOKENS)
+
+
 @dataclass(slots=True)
 class ScanResult:
     address: str
@@ -69,6 +87,38 @@ class BleTransport:
         self._callback: Callable[[bytes], None] | None = None
         self._disconnect_cb: Callable[[], None] | None = None
         self._closed = False
+        # Optional human-readable progress hook (the GUI shows these lines).
+        self.on_status: Callable[[str], None] | None = None
+
+    def _status(self, message: str) -> None:
+        LOG.info(message)
+        if self.on_status is not None:
+            self.on_status(message)
+
+    async def _recover_auth(self, exc: BaseException) -> bool:
+        """Bond with the watch at OS level, then let the caller retry once.
+
+        Windows refuses to touch the encrypted characteristics of an unpaired
+        watch, so a plain BLE connect is not enough: the device has to be
+        paired in Windows first. Asking the OS to pair here avoids making the
+        user find the Bluetooth settings page.
+        """
+        if not _is_auth_error(exc):
+            return False
+        client = self._client
+        if client is None or getattr(client, "pair", None) is None:
+            return False
+        self._status("手表要求系统级配对，正在请求 Windows 配对（手表上如弹出提示请确认）…")
+        try:
+            paired = await client.pair()
+        except NotImplementedError:
+            LOG.info("this BLE backend cannot pair programmatically")
+            return False
+        except Exception as err:  # noqa: BLE001 - pairing may fail in many ways
+            self._status(f"系统配对未完成：{err}")
+            return False
+        self._status("系统配对完成" if paired else "系统配对被取消或未完成")
+        return bool(paired)
 
     # -- lifecycle ------------------------------------------------------
     async def connect(self, address: str | None = None) -> None:
@@ -110,7 +160,12 @@ class BleTransport:
         if self._client is None:
             raise BleakError("not connected")
         self._callback = callback
-        await self._client.start_notify(C.NOTIFY_UUID, self._on_notify)
+        try:
+            await self._client.start_notify(C.NOTIFY_UUID, self._on_notify)
+        except BleakError as exc:
+            if not await self._recover_auth(exc):
+                raise
+            await self._client.start_notify(C.NOTIFY_UUID, self._on_notify)
 
     def _on_notify(self, _sender: int, data: bytearray) -> None:
         if self._callback is not None:
@@ -142,6 +197,9 @@ class BleTransport:
         try:
             await self._client.write_gatt_char(C.WRITE_UUID, data, response=self.use_response)
         except BleakError as exc:
+            if await self._recover_auth(exc):
+                await self._client.write_gatt_char(C.WRITE_UUID, data, response=self.use_response)
+                return
             message = str(exc).lower()
             if any(token in message for token in ("too long", "length", "attr", "mtu", "invalid")):
                 self.max_write_size = max(C.MIN_SLICE_SIZE, (self.max_write_size * 3) // 4)
