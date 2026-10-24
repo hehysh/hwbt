@@ -118,7 +118,7 @@ TLV: 0x7C = 0x01, 0x7D = IV(16), 0x7E = ciphertext
 
 - GCM：AES-GCM，12 或 16 字节 IV，密文末尾带 16 字节 tag，无 AAD。
 - CBC：AES-CBC + PKCS#7，16 字节 IV。发送时 IV 为 `random(12) || counter(BE32)`，counter 从 BondParams 响应开始逐包递增（HiChain Lite）；GCM 机型用随机 IV。
-- Gadgetbridge 在 Android 上使用“12 字节随机 + 4 字节计数器”的 IV；HuaSideload 和本项目使用 16 字节随机 IV，二者手表都接受。
+- Gadgetbridge 与 HiChain Lite 机型都使用“12 字节随机 + 4 字节计数器”的 IV；计数器让手表能识别重放并保持包序。
 
 ## 6. 文件上传（服务 0x28）
 
@@ -150,6 +150,15 @@ fileId (1) | index (1) | offset (BE32) | data (unitSize 字节)
 
 `index` 是本次请求内块的序号，从 0 开始；`offset` 是该块在文件中的绝对偏移。`unitSize` 由手表在 `0x28/0x04` 里给出（典型 200–244）。若块体加上帧头后超过分片大小，需要再按帧格式分片。
 
+速度相关的实现细节：
+
+- 单帧上限取 `ATT MTU - 3`（Windows 上由 `BleakClient.mtu_size` 读取），不再固定 244B；
+  大 MTU 适配器因此能把一个 `unitSize` 放进更少的帧。
+- 手表的 `0x28/0x05` 只给“下一次要多少字节、从哪开始”，节奏完全由固件决定；
+  手机侧只能把这一段尽量连续地写出去（本项目按窗口并发提交写入，失败时退回逐帧发送）。
+- 手表没有“中止上传”命令。取消上传时只能停止发送并丢弃后续的 `0x28/0x05`，
+  手表通常要等自己的超时才会恢复；残留的未完成文件由手表自行丢弃或留给用户删除。
+
 失败时手表发 `0x28/0x08`，`0x7F` 为错误码：
 
 | 错误码 | 含义 |
@@ -174,7 +183,7 @@ fileId (1) | index (1) | offset (BE32) | data (unitSize 字节)
 ## 8. 已知差异与限制
 
 - 本项目实现 HiChain 与 HiChain Lite 两种配对；更老的“普通模式”设备暂不支持。
-- Windows 的 BLE MTU 由系统协商，`bleak` 不直接暴露 MTU，因此按写入失败自动缩小分片重试。
+- Windows 的 BLE MTU 由系统协商，`bleak` 通过 `mtu_size` 暴露；若某次写入仍报长度错误，会按失败自动缩小分片重试。
 - 首次配对的确认弹窗由手表固件控制，超时时间已放宽到 45–90 秒。
 - 不实现删除单曲：参考实现只提供歌单操作（`0x25/0x08`），没有确认的单曲删除命令。
 - 协议随固件可能变化，遇到问题请导出诊断日志反馈。

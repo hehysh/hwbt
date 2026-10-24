@@ -10,7 +10,7 @@ from . import constants as C
 from .crypto import CryptoError
 from .metadata import Track, is_supported, read_track
 from .protocol import MusicStorage
-from .session import HuaweiSession, SessionError
+from .session import HuaweiSession, SessionError, UploadCancelled
 from .store import Settings
 from .transport import BleTransport, ScanResult, scan
 
@@ -188,6 +188,7 @@ class MusicApp:
             raise SessionError("该手表没有音乐服务（0x25），无法存歌")
 
         results: list[tuple[Track, str | None]] = []
+        cancelled = False
         for index, raw_path in enumerate(paths):
             path = Path(raw_path)
             if not is_supported(path):
@@ -209,14 +210,26 @@ class MusicApp:
                     progress=(lambda fraction, i=index: on_progress(i, fraction) if on_progress else None),
                 )
                 results.append((track, None))
+            except UploadCancelled:
+                cancelled = True
+                results.append((track, "已取消上传"))
+                for rest in paths[index + 1 :]:
+                    results.append((read_track(Path(rest)), "已取消上传"))
+                break
             except (SessionError, OSError) as exc:
                 self._log("error", f"{track.display}: {exc}")
                 results.append((track, str(exc)))
-        try:
-            await self.refresh_storage()
-        except SessionError as exc:
-            self._log("debug", f"刷新容量失败: {exc}")
+        if not cancelled:
+            try:
+                await self.refresh_storage()
+            except SessionError as exc:
+                self._log("debug", f"刷新容量失败: {exc}")
         return results
+
+    def cancel_upload(self) -> None:
+        """Stop the upload that is currently running, if any."""
+        if self.session is not None:
+            self.session.cancel_upload()
 
     async def disconnect(self) -> None:
         if self.session is not None:

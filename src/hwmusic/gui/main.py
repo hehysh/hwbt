@@ -280,9 +280,18 @@ class MainWindow(QMainWindow):
         self.btn_clear = QPushButton("清空")
         self.btn_upload = QPushButton("开始上传")
         self.btn_upload.setObjectName("primary")
+        self.btn_cancel = QPushButton("取消上传")
+        self.btn_cancel.setEnabled(False)
         self.btn_refresh = QPushButton("刷新容量")
         self.btn_songs = QPushButton("手表歌曲")
-        for button in (self.btn_add, self.btn_clear, self.btn_refresh, self.btn_songs, self.btn_upload):
+        for button in (
+            self.btn_add,
+            self.btn_clear,
+            self.btn_refresh,
+            self.btn_songs,
+            self.btn_upload,
+            self.btn_cancel,
+        ):
             toolbar.addWidget(button)
         layout.addLayout(toolbar)
 
@@ -342,6 +351,7 @@ class MainWindow(QMainWindow):
         self.btn_add.clicked.connect(self.pick_files)
         self.btn_clear.clicked.connect(self.clear_files)
         self.btn_upload.clicked.connect(self.start_upload)
+        self.btn_cancel.clicked.connect(self.cancel_upload)
         self.btn_refresh.clicked.connect(self.refresh_storage)
         self.btn_songs.clicked.connect(self.fetch_watch_songs)
         self.btn_export.clicked.connect(self.export_log)
@@ -560,6 +570,7 @@ class MainWindow(QMainWindow):
 
         self.uploading = True
         self._update_buttons()
+        self.progress.setFormat("%p%")
         self.progress.setValue(0)
         for row in range(self.table.rowCount()):
             self._set_status(row, "等待中")
@@ -580,6 +591,13 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.statusBar().showMessage(f"正在上传: {track.display}")
 
+    def cancel_upload(self) -> None:
+        if not self.uploading:
+            return
+        self.btn_cancel.setEnabled(False)
+        self.append_log("warn", "正在取消上传…")
+        self.worker.cancel_upload()
+
     def _on_file_progress(self, index: int, fraction: float) -> None:
         percent = int(fraction * 100)
         self._set_status(index, f"上传中 {percent}%")
@@ -587,14 +605,28 @@ class MainWindow(QMainWindow):
 
     def _on_upload_done(self, results: list) -> None:
         self.uploading = False
+        self.progress.setFormat("%p%")
         self._update_buttons()
+        cancelled = any(error and "取消" in str(error) for _track, error in results)
         failed = 0
         for index, (_track, error) in enumerate(results):
-            if error:
+            if error and "取消" in str(error):
+                self._set_status(index, "已取消")
+            elif error:
                 failed += 1
                 self._set_status(index, f"失败: {error}")
             else:
                 self._set_status(index, "完成")
+        if cancelled:
+            self.progress.setValue(self.progress.value())
+            self.append_log("warn", "上传已取消；手表可能仍在等待数据，请等几秒再继续操作")
+            self.statusBar().showMessage("已取消上传")
+            QMessageBox.information(
+                self,
+                "已取消",
+                "上传已取消。手表上可能残留未完成的文件，可在手表音乐列表中删除。",
+            )
+            return
         self.progress.setValue(100 if not failed else self.progress.value())
         summary = f"上传结束：成功 {len(results) - failed}，失败 {failed}"
         self.append_log("ok" if not failed else "warn", summary)
@@ -660,6 +692,14 @@ class MainWindow(QMainWindow):
             self.append_log("info", "手表打开了音乐界面")
         elif name == "udid":
             self.append_log("debug", f"手表 UDID: {payload.get('udid', '')}")
+        elif name == "speed":
+            kbps = 0.0
+            if isinstance(payload, dict):
+                try:
+                    kbps = float(payload.get("kbps", 0.0))
+                except (TypeError, ValueError):
+                    kbps = 0.0
+            self.progress.setFormat(f"%p%  ·  {kbps:.1f} KB/s")
 
     def _on_failed(self, message: str) -> None:
         self._set_busy(False, "操作失败")
@@ -692,7 +732,15 @@ class MainWindow(QMainWindow):
             item.setText(text)
 
     def _set_busy(self, busy: bool, message: str) -> None:
-        for widget in (self.btn_scan, self.btn_connect, self.btn_pair, self.btn_upload, self.btn_refresh, self.btn_songs):
+        for widget in (
+            self.btn_scan,
+            self.btn_connect,
+            self.btn_pair,
+            self.btn_upload,
+            self.btn_cancel,
+            self.btn_refresh,
+            self.btn_songs,
+        ):
             widget.setEnabled(not busy)
         self.statusBar().showMessage(message)
         if not busy:
@@ -701,6 +749,7 @@ class MainWindow(QMainWindow):
     def _update_buttons(self) -> None:
         has_files = bool(self.tracks)
         self.btn_upload.setEnabled(self.connected and has_files and not self.uploading)
+        self.btn_cancel.setEnabled(self.uploading)
         self.btn_add.setEnabled(not self.uploading)
         self.btn_clear.setEnabled(has_files and not self.uploading)
         self.btn_refresh.setEnabled(self.connected and not self.uploading)

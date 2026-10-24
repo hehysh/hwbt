@@ -148,6 +148,10 @@ class BleTransport:
         if not self._client.is_connected:
             raise BleakError("connect() returned without an active link")
         self._apply_mtu()
+        # WinRT updates GattSession.max_pdu_size asynchronously after the link
+        # is up; a second look avoids sizing every frame for a 23-byte MTU.
+        await asyncio.sleep(0.2)
+        self._apply_mtu()
         self._apply_write_type()
 
     def _apply_write_type(self) -> None:
@@ -190,8 +194,13 @@ class BleTransport:
         except Exception:  # noqa: BLE001 - backend may not expose it
             return
         if mtu > 23:
-            self.max_write_size = max(C.MIN_SLICE_SIZE, min(C.DEFAULT_SLICE_SIZE, mtu - 3))
-            LOG.info("negotiated ATT MTU %d -> %d-byte writes", mtu, self.max_write_size)
+            # The ATT payload is MTU - 3 and one frame is one ATT write, so use
+            # all of it: the watch advertises a 1022-byte slice and larger
+            # writes mean fewer round trips per upload unit.
+            self.max_write_size = max(C.MIN_SLICE_SIZE, mtu - 3)
+            self._status(f"蓝牙 MTU {mtu}，单帧最多 {self.max_write_size}B")
+        else:
+            self._status("蓝牙 MTU 尚未协商（23），先按 244B 发送，写入失败会自动缩小")
 
     def on_disconnect(self, callback: Callable[[], None]) -> None:
         self._disconnect_cb = callback

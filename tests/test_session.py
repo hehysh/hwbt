@@ -6,7 +6,7 @@ import pytest
 
 from hwmusic import constants as C
 from hwmusic.protocol import MusicStorage
-from hwmusic.session import HuaweiSession, SessionError
+from hwmusic.session import HuaweiSession, SessionError, UploadCancelled, UploadState
 from hwmusic.tlv import TLV
 
 from .fake_watch import FakeWatch, MockTransport
@@ -258,3 +258,112 @@ async def test_hichain_lite_upload_round_trip() -> None:
     data = b"lite" * 100
     await session.upload_file(data, "lite.mp3", C.FILE_TYPE_MUSIC)
     assert bytes(watch.received) == data
+
+
+class _RecordingTransport:
+    """Transport that records writes and how many were in flight at once."""
+
+    def __init__(self) -> None:
+        self.max_write_size = 244
+        self.writes: list[bytes] = []
+        self.in_flight = 0
+        self.peak = 0
+        self.fail_at: int | None = None
+
+    async def write(self, data: bytes) -> None:
+        self.in_flight += 1
+        self.peak = max(self.peak, self.in_flight)
+        try:
+            await asyncio.sleep(0.001)
+            self.writes.append(data)
+            if self.fail_at is not None and len(self.writes) == self.fail_at:
+                raise RuntimeError("write failed")
+        finally:
+            self.in_flight -= 1
+
+
+@pytest.mark.asyncio
+async def test_write_all_pipelines_and_keeps_order() -> None:
+    transport = _RecordingTransport()
+    session = HuaweiSession(transport, device_id=DEVICE_ID)
+    frames = [bytes([index]) for index in range(20)]
+    await session._write_all(frames)
+
+    assert transport.writes == frames
+    assert transport.peak > 1, "writes should be pipelined"
+    assert transport.peak <= session.write_window
+
+
+@pytest.mark.asyncio
+async def test_write_all_falls_back_to_serial_writes() -> None:
+    transport = _RecordingTransport()
+    transport.fail_at = 2
+    session = HuaweiSession(transport, device_id=DEVICE_ID)
+    await session._write_all([b"a", b"b", b"c", b"d"])
+
+    # Everything before the failing frame reached the watch; the rest is
+    # retried serially, so the tail is always the complete frame sequence.
+    assert transport.writes[-3:] == [b"b", b"c", b"d"]
+    assert session.write_window == 1
+
+
+@pytest.mark.asyncio
+async def test_report_speed_emits_an_event() -> None:
+    events: list[tuple[str, dict]] = []
+    watch = FakeWatch()
+    session = HuaweiSession(
+        MockTransport(watch),
+        device_id=DEVICE_ID,
+        on_event=lambda name, data: events.append((name, data)),
+    )
+    loop = asyncio.get_running_loop()
+    state = UploadState(
+        data=b"x" * 8192,
+        digest=b"",
+        name="speed.mp3",
+        file_type=C.FILE_TYPE_MUSIC,
+        progress=None,
+        future=loop.create_future(),
+    )
+    state.last_report = loop.time() - 2.0
+    state.sent = 2048
+
+    session._report_speed(state)
+
+    assert events and events[-1][0] == "speed"
+    assert events[-1][1]["kbps"] == pytest.approx(1.0, abs=0.1)
+    assert state.reported_bytes == 2048
+
+
+@pytest.mark.asyncio
+async def test_cancel_upload_stops_the_transfer() -> None:
+    watch = lite_watch()
+    session = make_session(watch)
+    await session.transport.connect()
+    await session.start()
+    await session.pair()
+
+    task = asyncio.ensure_future(
+        session.upload_file(b"cancel-me" * 20000, "big.mp3", C.FILE_TYPE_MUSIC)
+    )
+    for _ in range(1000):
+        if session._upload is not None and session._upload.sent > 0:
+            break
+        await asyncio.sleep(0)
+    assert session._upload is not None
+
+    session.cancel_upload()
+
+    with pytest.raises(UploadCancelled):
+        await task
+    assert session._upload is None
+    # Late chunk requests from the watch are ignored, not answered.
+    session._handle_upload(C.UPLOAD_CMD_CHUNK_PARAMS, TLV().put(0x02, b"\x00\x00\x00\x00").put(0x03, b"\x00\x10"))
+    assert session._upload is None
+
+
+@pytest.mark.asyncio
+async def test_cancel_without_upload_is_a_noop() -> None:
+    watch = FakeWatch()
+    session = make_session(watch)
+    session.cancel_upload()  # must not raise

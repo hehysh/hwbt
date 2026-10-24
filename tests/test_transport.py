@@ -33,6 +33,13 @@ def test_mtu_is_used_for_write_size() -> None:
     assert transport.max_write_size == 97
 
 
+def test_large_mtu_is_not_capped_at_the_watch_slice_size() -> None:
+    transport = BleTransport("AA:BB")
+    transport._client = _FakeClient(517)  # type: ignore[assignment]
+    transport._apply_mtu()
+    assert transport.max_write_size == 514
+
+
 def test_minimum_mtu_keeps_default_slice_size() -> None:
     transport = BleTransport("AA:BB")
     transport._client = _FakeClient(23)  # type: ignore[assignment]

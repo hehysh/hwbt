@@ -52,6 +52,12 @@ class AsyncWorker(QThread):
             raise RuntimeError("worker is not running")
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
+    def cancel_upload(self) -> None:
+        """Ask the asyncio loop to stop the running upload (thread-safe)."""
+        if self._loop is None or self.app is None:
+            return
+        self._loop.call_soon_threadsafe(self.app.cancel_upload)
+
     def stop(self) -> None:
         if self._loop is None:
             return

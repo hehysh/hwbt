@@ -60,6 +60,10 @@ class WatchError(SessionError):
         super().__init__(P.describe_upload_error(code))
 
 
+class UploadCancelled(SessionError):
+    """The user stopped the upload before the watch finished receiving it."""
+
+
 @dataclass(slots=True)
 class UploadState:
     data: bytes
@@ -73,6 +77,8 @@ class UploadState:
     encrypt: bool = True
     last_activity: float = 0.0
     sent: int = 0
+    last_report: float = 0.0
+    reported_bytes: int = 0
 
 
 class HuaweiSession:
@@ -100,7 +106,13 @@ class HuaweiSession:
 
         self._waiters: dict[tuple[int, int], asyncio.Future] = {}
         self._write_lock = asyncio.Lock()
+        # How many GATT writes to keep in flight. Windows serialises GATT
+        # operations anyway, but not awaiting each completion lets the stack
+        # pack several write commands into one connection event, which is
+        # where most of the upload time goes.
+        self.write_window = 8
         self._upload: UploadState | None = None
+        self._chunk_task: asyncio.Task | None = None
         self._music_metadata: dict[str, tuple[str, str]] = {}
         self._closed = False
         self._tasks: set[asyncio.Task] = set()
@@ -254,8 +266,35 @@ class HuaweiSession:
 
     async def _write_all(self, frames: list[bytes]) -> None:
         async with self._write_lock:
-            for frame in frames:
-                await self.transport.write(frame)
+            window = max(1, self.write_window)
+            if window == 1 or len(frames) == 1:
+                for frame in frames:
+                    await self.transport.write(frame)
+                return
+            start = 0
+            while start < len(frames):
+                batch = frames[start : start + window]
+                results = await asyncio.gather(
+                    *(self.transport.write(frame) for frame in batch),
+                    return_exceptions=True,
+                )
+                errors = [item for item in results if isinstance(item, BaseException)]
+                if not errors:
+                    start += len(batch)
+                    continue
+                # Some Windows stacks accept only one outstanding GATT
+                # operation. Fall back to plain serial writes, resuming at the
+                # first frame that failed: everything before it definitely
+                # reached the watch, and a repeat of a later unit carries the
+                # same absolute offset, so it lands on the same bytes.
+                first_error = next(
+                    index for index, item in enumerate(results) if isinstance(item, BaseException)
+                )
+                self.write_window = 1
+                self._log("warn", f"并发写入不受支持（{errors[0]}），改为逐帧发送")
+                for frame in frames[start + first_error :]:
+                    await self.transport.write(frame)
+                return
 
     async def request(
         self,
@@ -688,7 +727,29 @@ class HuaweiSession:
             raise SessionError("上传超时：手表长时间没有请求数据") from exc
         finally:
             watchdog.cancel()
+            self._chunk_task = None
             self._upload = None
+
+    def cancel_upload(self) -> None:
+        """Stop the current upload (the watch offers no abort command).
+
+        The watch may keep waiting for the chunk it asked for until its own
+        timeout, so the caller should tell the user to wait a few seconds
+        before starting another transfer.
+        """
+        state = self._upload
+        if state is None or state.future.done():
+            return
+        task = self._chunk_task
+        self._chunk_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        # Drop the state first: any chunk request already in flight from the
+        # watch is then ignored instead of being answered after the cancel.
+        self._upload = None
+        if not state.future.done():
+            state.future.set_exception(UploadCancelled("已取消上传"))
+        self._log("warn", f"已取消上传 {state.name}（已发送 {state.sent / 1024:.0f} KB）")
 
     async def _upload_watchdog(self, state: UploadState) -> None:
         """Fail the upload when the watch stops asking for data."""
@@ -729,6 +790,12 @@ class HuaweiSession:
                 f"传输参数: 单元 {state.unit_size}B，"
                 f"{'不额外加密' if not state.encrypt else '分块加密'}",
             )
+            self._log(
+                "debug",
+                f"手表传输参数: 协议 {params.protocol_version or '?'}, "
+                f"wait {params.app_wait_time}, 单次上限 {params.max_apply_data_size}B, "
+                f"interval {params.interval}, 单帧 {self.transport.max_write_size}B",
+            )
             self.send(
                 C.SERVICE_FILE_UPLOAD,
                 C.UPLOAD_CMD_CONSULT,
@@ -740,8 +807,11 @@ class HuaweiSession:
             if size <= 0 or state.unit_size <= 0 or offset > len(state.data):
                 self._fail_upload(SessionError(f"手表请求了无效的数据段 offset={offset} size={size}"))
                 return
+            if self.debug:
+                self._log("debug", f"手表请求数据段: offset={offset} size={size}")
             chunk = state.data[offset : offset + size]
             task = asyncio.ensure_future(self._send_chunk(state, chunk, offset))
+            self._chunk_task = task
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
         elif command == C.UPLOAD_CMD_RESULT:
@@ -761,19 +831,37 @@ class HuaweiSession:
     async def _send_chunk(self, state: UploadState, chunk: bytes, offset: int) -> None:
         try:
             await self._write_chunk_frames(state, chunk, offset)
-            state.sent = offset + len(chunk)
-            if state.progress and state.data:
-                state.progress(min(1.0, state.sent / len(state.data)))
         except SliceTooLarge:
             try:
                 await self._write_chunk_frames(state, chunk, offset)
-                state.sent = offset + len(chunk)
-                if state.progress and state.data:
-                    state.progress(min(1.0, state.sent / len(state.data)))
             except Exception as exc:  # noqa: BLE001
                 self._fail_upload(SessionError(f"发送数据块失败: {exc}"))
+                return
         except Exception as exc:  # noqa: BLE001
             self._fail_upload(SessionError(f"发送数据块失败: {exc}"))
+            return
+        state.sent = offset + len(chunk)
+        if state.progress and state.data:
+            state.progress(min(1.0, state.sent / len(state.data)))
+        self._report_speed(state)
+
+    def _report_speed(self, state: UploadState) -> None:
+        """Log the achieved throughput every couple of seconds."""
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if state.last_report == 0.0:
+            state.last_report = now
+            state.reported_bytes = state.sent
+            return
+        elapsed = now - state.last_report
+        if elapsed < 2.0:
+            return
+        delta = state.sent - state.reported_bytes
+        kbps = delta / elapsed / 1024
+        state.last_report = now
+        state.reported_bytes = state.sent
+        self._log("info", f"上传速度 {kbps:.1f} KB/s")
+        self._on_event("speed", {"kbps": round(kbps, 1)})
 
     async def _write_chunk_frames(self, state: UploadState, chunk: bytes, offset: int) -> None:
         payloads = P.chunk_payloads(chunk, offset, state.unit_size, state.file_id)
