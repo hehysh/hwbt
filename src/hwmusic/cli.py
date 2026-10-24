@@ -74,6 +74,22 @@ async def cmd_info(args: argparse.Namespace) -> int:
         await app.disconnect()
 
 
+async def cmd_songs(args: argparse.Namespace) -> int:
+    app = await _connect(args)
+    try:
+        songs = await app.music_list()
+        if not songs:
+            print("手表上没有歌曲（或该型号不返回歌曲列表）")
+            return 0
+        for song in songs:
+            artist = song.artist or "未知歌手"
+            print(f"{song.index:3d}  {song.title} — {artist}  [{song.file_name}]")
+        print(f"共 {len(songs)} 首")
+        return 0
+    finally:
+        await app.disconnect()
+
+
 async def cmd_upload(args: argparse.Namespace) -> int:
     paths = [Path(p) for p in args.files]
     missing = [str(p) for p in paths if not p.exists()]
@@ -126,6 +142,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_info = sub.add_parser("info", help="连接并显示设备信息")
     common(p_info)
     p_info.set_defaults(func=cmd_info)
+
+    p_songs = sub.add_parser("songs", help="列出手表上的歌曲")
+    common(p_songs)
+    p_songs.set_defaults(func=cmd_songs)
 
     p_upload = sub.add_parser("upload", help="上传音乐文件")
     p_upload.add_argument("files", nargs="+", help="音频文件（mp3/m4a/aac/flac/wav/opus）")

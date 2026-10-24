@@ -83,6 +83,19 @@ class BleTransport:
         await self._client.connect()
         if not self._client.is_connected:
             raise BleakError("connect() returned without an active link")
+        self._apply_mtu()
+
+    def _apply_mtu(self) -> None:
+        """Size frames to the negotiated ATT MTU when the OS reports it."""
+        if self._client is None:
+            return
+        try:
+            mtu = int(self._client.mtu_size)
+        except Exception:  # noqa: BLE001 - backend may not expose it
+            return
+        if mtu > 23:
+            self.max_write_size = max(C.MIN_SLICE_SIZE, min(C.DEFAULT_SLICE_SIZE, mtu - 3))
+            LOG.info("negotiated ATT MTU %d -> %d-byte writes", mtu, self.max_write_size)
 
     def on_disconnect(self, callback: Callable[[], None]) -> None:
         self._disconnect_cb = callback

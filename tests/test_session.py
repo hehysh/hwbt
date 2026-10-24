@@ -121,6 +121,37 @@ async def test_music_list_returns_stored_songs() -> None:
 
 
 @pytest.mark.asyncio
+async def test_music_list_pages_one_song_at_a_time() -> None:
+    class PagedWatch(FakeWatch):
+        def _music_list(self, tlv) -> None:  # noqa: ANN001
+            assert tlv is not None
+            start = tlv.integer(0x01) or 0
+            inner = TLV()
+            for index, title, artist, name in self.songs:
+                if index == start:
+                    inner.put(
+                        0x83,
+                        TLV()
+                        .put(0x04, bytes([index]))
+                        .put(0x05, title)
+                        .put(0x06, artist)
+                        .put(0x07, name)
+                        .serialize(),
+                    )
+            self.send(
+                0x25,
+                0x05,
+                TLV().put(0x01, start.to_bytes(2, "big")).put(0x04, b"\xff\xff").put(0x82, inner.serialize()),
+            )
+
+    watch = PagedWatch()
+    session = make_session(watch)
+    await pair(session, watch)
+    songs = await session.music_list()
+    assert [song.title for song in songs] == ["晨跑", "夜曲"]
+
+
+@pytest.mark.asyncio
 async def test_upload_rejects_unsupported_state() -> None:
     watch = FakeWatch()
     session = make_session(watch)

@@ -94,6 +94,7 @@ python run_gui.py
 ```bash
 hwmusic scan                 # 扫描
 hwmusic info                 # 连接并显示设备信息（首次会配对）
+hwmusic songs                # 列出手表上的歌曲
 hwmusic upload song.mp3      # 上传
 hwmusic upload *.flac --debug
 ```
