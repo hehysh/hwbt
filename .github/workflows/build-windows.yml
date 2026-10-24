@@ -1,0 +1,42 @@
+name: build-windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[gui,build,dev]"
+
+      - name: Generate icon
+        run: python packaging/make_icon.py
+
+      - name: Run tests
+        run: python -m pytest -q
+
+      - name: GUI smoke test
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python run_gui.py --smoke-test
+
+      - name: Build one-file exe
+        run: pyinstaller packaging/hwmusic.spec --noconfirm --clean
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HuaweiMusic-windows
+          path: dist/HuaweiMusic.exe
+          if-no-files-found: error

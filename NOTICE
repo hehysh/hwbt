@@ -1,0 +1,30 @@
+HuaweiMusic (华为手表传歌)
+Copyright (C) 2026 HuaweiMusic contributors
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See LICENSE.
+
+Protocol research and reference implementations
+-----------------------------------------------
+
+This project is an independent reimplementation of the Huawei "lite wearable"
+BLE protocol. It was written from the following AGPL-3.0 licensed sources:
+
+* Gadgetbridge — https://codeberg.org/Freeyourgadget/Gadgetbridge
+  Copyright (C) Gadgetbridge contributors.
+  Relevant files: devices/huawei/HuaweiPacket.java, HuaweiTLV.java,
+  HuaweiCrypto.java, packets/FileUpload.java, packets/MusicControl.java,
+  service/devices/huawei/HuaweiUploadManager.java, HuaweiMusicManager.java and
+  the request classes under service/devices/huawei/requests/.
+
+* HuaSideload — https://github.com/Burak4Arslan/huawei-watch-sideload-ios
+  Copyright (C) Burak Arslan and contributors.
+  A Swift port of the Gadgetbridge Huawei code with on-device verification
+  (HuaweiProtocol.swift, HuaweiAuth.swift, HuaweiFeatures.swift,
+  HuaweiSession.swift).
+
+No Huawei proprietary code, firmware, keys or other assets are included.
+"Huawei" is a trademark of Huawei Technologies Co., Ltd. This project is not
+affiliated with or endorsed by Huawei.

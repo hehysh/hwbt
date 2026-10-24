@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hwmusic"
+version = "0.1.0"
+description = "Upload music to Huawei GT-series watches over BLE, without Huawei Health"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+    "bleak>=0.22",
+    "cryptography>=42",
+    "mutagen>=1.47",
+]
+
+[project.optional-dependencies]
+gui = ["PySide6>=6.6"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.5"]
+build = ["pyinstaller>=6.6"]
+
+[project.scripts]
+hwmusic = "hwmusic.cli:main"
+
+[project.gui-scripts]
+hwmusic-gui = "hwmusic.gui.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+hwmusic = ["gui/icon.png"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "BLE"]
+ignore = ["E501", "SIM105"]
