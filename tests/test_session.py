@@ -271,12 +271,14 @@ class _RecordingTransport:
         self.fail_at: int | None = None
 
     async def write(self, data: bytes) -> None:
+        # Record at submission time: that is the order the BLE stack sees.
+        position = len(self.writes) + 1
+        self.writes.append(data)
         self.in_flight += 1
         self.peak = max(self.peak, self.in_flight)
         try:
             await asyncio.sleep(0.001)
-            self.writes.append(data)
-            if self.fail_at is not None and len(self.writes) == self.fail_at:
+            if self.fail_at is not None and position == self.fail_at:
                 raise RuntimeError("write failed")
         finally:
             self.in_flight -= 1
