@@ -8,6 +8,14 @@
 
 > 非官方工具。与华为公司无关，使用风险自负。
 
+## 下载
+
+**[⬇ 下载 HuaweiMusic.exe](https://github.com/hehysh/hwbt/releases/latest)**（单文件，免安装，Windows 10/11 64 位）
+
+- 首次运行如提示“未知发布者”，点「更多信息 → 仍要运行」。
+- exe 由 GitHub Actions 在本仓库源码上自动构建（`.github/workflows/build-windows.yml`），也可按文末步骤自行打包或直接从源码运行。
+- 文件哈希（SHA-256）见对应的 Release 说明。
+
 ## 功能
 
 - 扫描并连接附近的手表，首次配对后在本地记住密钥（下次一键连接）
