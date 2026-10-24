@@ -17,7 +17,9 @@ from .crypto import (
     aes_cbc_encrypt,
     aes_gcm_open,
     aes_gcm_seal,
+    digest_lite,
     hmac_sha256,
+    initialization_vector,
     random_bytes,
     sha256,
 )
@@ -92,6 +94,7 @@ class HuaweiSession:
         self.parser = PacketParser()
         self.link: P.LinkInfo | None = None
         self.session_key: bytes | None = None
+        self._encrypt_counter = 0
         self.paired = False
         self.watch_name: str | None = None
 
@@ -207,7 +210,12 @@ class HuaweiSession:
     def _encrypt_body(self, body: bytes) -> bytes:
         if self.session_key is None or self.link is None:
             raise NotPairedError("尚未与手表完成配对")
-        iv = random_bytes(16)
+        if self.link.uses_gcm:
+            iv = random_bytes(16)
+        else:
+            # CBC links expect the trailing counter to advance (Gadgetbridge
+            # does the same); the watch uses it to order our packets.
+            iv, self._encrypt_counter = initialization_vector(self._encrypt_counter)
         cipher = (
             aes_gcm_seal(body, self.session_key, iv)
             if self.link.uses_gcm
@@ -292,14 +300,15 @@ class HuaweiSession:
     # pairing
     # ------------------------------------------------------------------
     async def pair(self, *, saved_token: bytes | None = None, token_saver: Callable[[bytes], None] | None = None) -> bytes:
-        """Run LinkParams → SecurityNegotiation → (PIN) → HiChain.
+        """Run LinkParams → SecurityNegotiation → pairing (HiChain or Lite).
 
         Returns the permanent auth token (saved by the caller).
         """
         self.paired = False
         self.session_key = None
+        self._encrypt_counter = 0
 
-        self._log("info", "1/4 读取链路参数…")
+        self._log("info", "读取链路参数…")
         response = await self.request(
             C.SERVICE_DEVICE_CONFIG, C.CMD_LINK_PARAMS, P.link_params_request(), label="链路参数", encrypted=False
         )
@@ -312,7 +321,7 @@ class HuaweiSession:
         if link.device_support_type not in (1, 2, 3, 4):
             raise SessionError(f"不支持的手表类型 {link.device_support_type}（需要 HiChain 配对）")
 
-        self._log("info", "2/4 安全协商…")
+        self._log("info", "安全协商…")
         response = await self.request(
             C.SERVICE_DEVICE_CONFIG,
             C.CMD_SECURITY_NEGOTIATION,
@@ -332,13 +341,19 @@ class HuaweiSession:
         if udid and len(udid) == 64:
             self._on_event("udid", {"udid": udid.decode("ascii", "replace")})
         self._log("info", f"配对类型: 0x{auth_type:X}")
-        if not P.is_hichain(auth_type):
-            raise SessionError(
-                f"该手表使用不支持的配对方式 0x{auth_type:X}（本工具只实现 HiChain）"
-            )
+        if P.is_hichain(auth_type):
+            return await self._pair_hichain(link, saved_token, token_saver)
+        if P.is_hichain_lite(auth_type):
+            return await self._pair_lite(link, saved_token, token_saver)
+        raise SessionError(
+            f"该手表使用不支持的配对方式 0x{auth_type:X}（支持 HiChain 与 HiChain Lite）"
+        )
 
+    async def _pair_hichain(
+        self, link: P.LinkInfo, saved_token: bytes | None, token_saver: Callable[[bytes], None] | None
+    ) -> bytes:
         if saved_token is None:
-            self._log("info", "3/4 请求 PIN 码（手表上如弹出配对提示请点确认）…")
+            self._log("info", "请求 PIN 码（手表上如弹出配对提示请点确认）…")
             pin_response = await self.request(
                 C.SERVICE_DEVICE_CONFIG,
                 C.CMD_PIN_CODE,
@@ -358,14 +373,118 @@ class HuaweiSession:
             self._log("ok", "已获得永久配对密钥并保存")
         else:
             token = saved_token
-            self._log("info", "3/4 已有保存的配对密钥，跳过 PIN")
+            self._log("info", "已有保存的配对密钥，跳过 PIN")
 
-        self._log("info", "4/4 HiChain 绑定，协商会话密钥…")
+        self._log("info", "HiChain 绑定，协商会话密钥…")
         session_key = await self._hichain(operation=2, key=token, timeout=60.0)
         self.session_key = session_key
         self.paired = True
         self._log("ok", "配对完成，连接已加密")
         return token
+
+    async def _pair_lite(
+        self, link: P.LinkInfo, saved_token: bytes | None, token_saver: Callable[[bytes], None] | None
+    ) -> bytes:
+        """HiChain Lite: PIN challenge, then bond with a locally generated key.
+
+        Gadgetbridge calls this "HiChain Lite"; it is what the GT 2e and other
+        device support types 1-3 speak instead of the ISO HiChain handshake.
+        """
+        secret_key = saved_token if saved_token and len(saved_token) == 16 else random_bytes(16)
+        key = secret_key
+        if link.auth_version != 0x02:
+            self._log("info", "HiChain Lite：读取 PIN 码（手表上如弹出配对提示请点确认）…")
+            pin_response = await self.request(
+                C.SERVICE_DEVICE_CONFIG,
+                C.CMD_PIN_CODE,
+                P.pincode_request(),
+                label="PIN 码",
+                encrypted=False,
+                timeout=45.0,
+            )
+            if pin_response.tlv is None:
+                raise SessionError("PIN 响应为空")
+            key = P.decrypt_pincode(pin_response.tlv, link)
+            self._log("info", f"PIN 已解密（{len(key)} 字节）")
+
+        client_nonce = random_bytes(16)
+        double_nonce = link.server_nonce + client_nonce
+        challenge = digest_lite(
+            b"\x01\x00", key, double_nonce, auth_version=link.auth_version, auth_algo=link.auth_algo
+        )
+        first_key = challenge[32:48]
+
+        self._log("info", "HiChain Lite：校验手表身份…")
+        response = await self.request(
+            C.SERVICE_DEVICE_CONFIG,
+            C.CMD_AUTH,
+            P.auth_request(
+                challenge[:32], P.auth_nonce(link.auth_version, client_nonce), link.auth_algo
+            ),
+            label="认证",
+            encrypted=False,
+            timeout=45.0,
+        )
+        if response.tlv is None:
+            raise SessionError("认证响应为空")
+        expected = digest_lite(
+            b"\x01\x10", key, double_nonce, auth_version=link.auth_version, auth_algo=link.auth_algo
+        )[:32]
+        actual = response.tlv.get(0x01) or b""
+        if actual != expected:
+            raise CryptoError("HiChain Lite 校验失败：PIN 不匹配或手表拒绝了本次连接")
+
+        serial, mac = self.identity()
+        response = await self.request(
+            C.SERVICE_DEVICE_CONFIG,
+            C.CMD_BOND_PARAMS,
+            P.bond_params_request(serial, mac),
+            label="绑定参数",
+            encrypted=False,
+        )
+        status, counter = P.parse_bond_params(response.tlv) if response.tlv else (0, 0)
+        if status not in (0, 1):
+            self._log("warn", f"绑定参数返回状态 {status}")
+
+        iv, counter = initialization_vector(counter)
+        wrapped = (
+            aes_gcm_seal(secret_key, first_key, iv)
+            if link.encrypt_method == 1
+            else aes_cbc_encrypt(secret_key, first_key, iv)
+        )
+        self._log("info", "HiChain Lite：提交配对密钥…")
+        try:
+            await self.request(
+                C.SERVICE_DEVICE_CONFIG,
+                C.CMD_BOND,
+                P.bond_request(serial, wrapped, iv),
+                label="绑定",
+                encrypted=False,
+                timeout=20.0,
+            )
+        except SessionError as exc:
+            if "超时" not in str(exc):
+                raise
+            self._log("warn", "手表没有确认绑定，继续尝试加密通信")
+
+        self.session_key = secret_key
+        self._encrypt_counter = counter
+        if token_saver:
+            token_saver(secret_key)
+        self.paired = True
+        self._log("ok", "配对完成，连接已加密")
+        return secret_key
+
+    def identity(self) -> tuple[bytes, bytes]:
+        """A stable serial + MAC pair for this installation.
+
+        Gadgetbridge sends the phone's Bluetooth MAC here; we derive one from
+        the persisted device id so the watch always sees the same peer.
+        """
+        raw = self.device_id.decode("ascii", "ignore")
+        hexid = (raw + "0" * 12)[:12].upper()
+        mac = ":".join(hexid[i : i + 2] for i in range(0, 12, 2))
+        return hexid[6:12].encode("ascii"), mac.encode("ascii")
 
     async def _hichain(self, *, operation: int, key: bytes, timeout: float) -> bytes:
         message = P.HiChainMessage(

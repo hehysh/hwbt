@@ -61,7 +61,8 @@ VarInt 为大端、每字节 7 位，最高位 `0x80` 表示后续还有字节�
 2. `0x01/0x33` SecurityNegotiation（不加密）
    - 请求：`0x01` 认证模式（设备类型 4 用 `0x04`，否则 `0x02`）、`0x05` 本机身份（16 随机字节的大写 hex ASCII，32 字节）、`0x03 0x01`、`0x04 0x00`；`0x04` 模式再加 `0x06`、`0x07` 手机型号；GCM 时加 `0x0D 0x01`。
    - 响应：`0x01`/`0x02`/`0x7F` 给出认证类型，`0x05` 可能是 64 字节 UDID。
-   - 只支持 HiChain：`type == 100000`，或 `type ^ 1 == 4`，或 `type ^ 2 == 4`。
+   - `type == 100000`，或 `type ^ 1 == 4`，或 `type ^ 2 == 4` → HiChain（下面的第 3–4 步）。
+   - `type == 0x01` 或 `0x02`（设备类型 1–3，例如 GT 2e）→ HiChain Lite（见 4b）。
 3. `0x01/0x2C` PinCode（不加密）
    - 请求：`0x01` 空值。
    - 响应：`0x01` 密文、`0x02` IV。密钥是固定 digest secret（按 authVersion 选 V1/V2/V3）；GCM 时用 `AES-GCM` 直接解密，否则 `AES-CBC` + PKCS#7。
@@ -83,6 +84,30 @@ VarInt 为大端、每字节 7 位，最高位 `0x80` 表示后续还有字节�
 
 JSON 使用紧凑格式（无空格），字段顺序与参考实现一致；`message` 字段在 op2 时或上 `0x10`，并带 `isDeviceLevel: false`。
 
+### 4b. 配对（HiChain Lite，设备类型 1–3）
+
+本机先生成一个随机 16 字节密钥 `secretKey`（首次配对时生成，之后按 BLE 地址保存；它就是后续的会话密钥）。
+
+1. `0x01/0x2C` PinCode：同上，用固定 digest secret 解出 PIN（authVersion 2 时跳过此步）。
+2. `0x01/0x13` Auth（不加密）
+   - 请求：`0x01` challenge(32)、`0x02` authVersion(BE16) + clientNonce(16)、`0x03` authAlgo。
+   - `digest(message, key, nonce)`：
+     - `hashKey = SHA256(hexUpper(key))`，把 `hashKey[i]` 异或进 digest secret（按 authVersion 选 V1/V2/V3）。
+     - `msg = secret(16) || message(2)`；`authAlgo == 1` 时 `step = PBKDF2-SHA256(hexUpper(msg), hexUpper(nonce), 1000, 32)`，否则 `step = HMAC-SHA256(msg, nonce)`。
+     - 返回 `HMAC-SHA256(step, nonce) || step`（64 字节）。
+   - challenge 用 `message = 0x01 0x00`，`key` = PIN（authVersion 2 时用 secretKey），`nonce = serverNonce || clientNonce`；取前 32 字节发送，`[32:48]` 作为 `firstKey`。
+   - 响应 `0x01` 应等于 `digest(0x01 0x10, ...)[:32]`。
+3. `0x01/0x0F` BondParams（不加密）
+   - 请求：`0x01` 空、`0x03` 序列号（6 字节 ASCII，取自本机 MAC 去掉冒号后第 6–12 位）、`0x04 0x02`、`0x05` 空、`0x07` 本机 MAC（17 字节 ASCII）、`0x09` 空。
+   - 响应：`0x01` 状态、`0x09` 加密计数器（BE32）。
+4. `0x01/0x0E` Bond（不加密）
+   - `iv = random(12) || counter(BE32)`，counter 为上一步的值 +1。
+   - `wrapped = AES-CBC(secretKey, key = firstKey, iv)`（GCM 机型用 AES-GCM）。
+   - 请求：`0x01` 空、`0x03 0x00`、`0x05` 序列号、`0x06` wrapped、`0x07` iv。
+   - 此后 `sessionKey = secretKey`，加密计数器从 iv 尾部继续递增。
+
+本机 MAC 由持久化的 device id 推导，保证每次连接手表看到的是同一个对端。
+
 ## 5. 传输加密
 
 配对完成后，除少数握手包外，所有请求/响应的 body 都替换为：
@@ -92,7 +117,7 @@ TLV: 0x7C = 0x01, 0x7D = IV(16), 0x7E = ciphertext
 ```
 
 - GCM：AES-GCM，12 或 16 字节 IV，密文末尾带 16 字节 tag，无 AAD。
-- CBC：AES-CBC + PKCS#7，16 字节 IV。
+- CBC：AES-CBC + PKCS#7，16 字节 IV。发送时 IV 为 `random(12) || counter(BE32)`，counter 从 BondParams 响应开始逐包递增（HiChain Lite）；GCM 机型用随机 IV。
 - Gadgetbridge 在 Android 上使用“12 字节随机 + 4 字节计数器”的 IV；HuaSideload 和本项目使用 16 字节随机 IV，二者手表都接受。
 
 ## 6. 文件上传（服务 0x28）
@@ -148,7 +173,7 @@ fileId (1) | index (1) | offset (BE32) | data (unitSize 字节)
 
 ## 8. 已知差异与限制
 
-- 本项目只实现 HiChain 配对；使用传统 PIN 配对的老设备会提示不支持。
+- 本项目实现 HiChain 与 HiChain Lite 两种配对；更老的“普通模式”设备暂不支持。
 - Windows 的 BLE MTU 由系统协商，`bleak` 不直接暴露 MTU，因此按写入失败自动缩小分片重试。
 - 首次配对的确认弹窗由手表固件控制，超时时间已放宽到 45–90 秒。
 - 不实现删除单曲：参考实现只提供歌单操作（`0x25/0x08`），没有确认的单曲删除命令。

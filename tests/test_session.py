@@ -203,3 +203,58 @@ async def test_upload_with_unencrypted_chunks() -> None:
     await asyncio.sleep(0.05)
     assert bytes(watch.received) == payload
     assert watch.upload_done is True
+
+
+def lite_watch(**kwargs) -> FakeWatch:
+    """GT 2e-like peer: device type 2, auth version 1, PBKDF2 digest, AES-CBC."""
+    return FakeWatch(
+        auth_version=1, support_type=2, auth_algo=1, encrypt_method=0, **kwargs
+    )
+
+
+@pytest.mark.asyncio
+async def test_hichain_lite_pairing_bonds_and_encrypts() -> None:
+    watch = lite_watch()
+    session = make_session(watch)
+    tokens: list[bytes] = []
+    await session.transport.connect()
+    await session.start()
+    token = await session.pair(token_saver=tokens.append)
+
+    assert session.paired is True
+    assert len(token) == 16
+    assert session.session_key == token == watch.session_key
+    assert tokens == [token]
+    # The link is encrypted after bonding, so a normal request must work.
+    assert await session.battery() == 0x5A
+
+
+@pytest.mark.asyncio
+async def test_hichain_lite_reconnect_reuses_the_saved_key() -> None:
+    watch = lite_watch()
+    session = make_session(watch)
+    await session.transport.connect()
+    await session.start()
+    token = await session.pair()
+
+    watch.session_key = None
+    session2 = make_session(watch)
+    await session2.transport.connect()
+    await session2.start()
+    await session2.pair(saved_token=token)
+
+    assert session2.paired is True
+    assert session2.session_key == token
+    assert await session2.battery() == 0x5A
+
+
+@pytest.mark.asyncio
+async def test_hichain_lite_upload_round_trip() -> None:
+    watch = lite_watch()
+    session = make_session(watch)
+    await session.transport.connect()
+    await session.start()
+    await session.pair()
+    data = b"lite" * 100
+    await session.upload_file(data, "lite.mp3", C.FILE_TYPE_MUSIC)
+    assert bytes(watch.received) == data

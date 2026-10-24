@@ -3,14 +3,17 @@ from __future__ import annotations
 import pytest
 
 from hwmusic.crypto import (
+    DIGEST_SECRET_V1,
     CryptoError,
     aes_cbc_decrypt,
     aes_cbc_encrypt,
     aes_gcm_open,
     aes_gcm_seal,
+    digest_lite,
     digest_secret,
     hkdf_sha256,
     hmac_sha256,
+    initialization_vector,
     ordered_json,
     sha256,
 )
@@ -84,3 +87,45 @@ def test_digest_secrets_are_stable() -> None:
 def test_ordered_json_keeps_order_and_is_compact() -> None:
     data = {"b": 1, "a": {"y": "1.0.0", "x": 0}}
     assert ordered_json(data) == b'{"b":1,"a":{"y":"1.0.0","x":0}}'
+
+
+def test_digest_lite_matches_gadgetbridge_formula() -> None:
+    import hashlib
+    import hmac as _hmac
+
+    key = bytes(range(16))
+    nonce = bytes(range(16, 32))
+    message = b"\x01\x00"
+
+    def hexup(data: bytes) -> bytes:
+        return data.hex().upper().encode("ascii")
+
+    secret = bytearray(DIGEST_SECRET_V1)
+    hash_key = hashlib.sha256(hexup(key)).digest()
+    for i in range(16):
+        secret[i] ^= hash_key[i]
+    msg = bytes(secret) + message
+    step = hashlib.pbkdf2_hmac("sha256", hexup(msg), hexup(nonce), 1000, dklen=32)
+    expected = _hmac.new(step, nonce, hashlib.sha256).digest() + step
+
+    assert digest_lite(message, key, nonce, auth_version=1, auth_algo=0x01) == expected
+    assert len(expected) == 64
+
+
+def test_digest_lite_uses_hmac_when_auth_algo_is_zero() -> None:
+    key = b"pin-code"
+    nonce = b"\x11" * 32
+    result = digest_lite(b"\x01\x10", key, nonce, auth_version=1, auth_algo=0)
+    assert len(result) == 64
+    assert result[:32] == hmac_sha256(result[32:], nonce)
+
+
+def test_initialization_vector_advances_the_counter() -> None:
+    iv, counter = initialization_vector(0x10203040)
+    assert len(iv) == 16
+    assert counter == 0x10203041
+    assert iv[12:] == (0x10203041).to_bytes(4, "big")
+
+    iv, counter = initialization_vector(0xFFFFFFFF)
+    assert counter == 1
+    assert iv[12:] == b"\x00\x00\x00\x01"

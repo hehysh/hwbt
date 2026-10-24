@@ -113,6 +113,54 @@ def is_hichain(auth_type: int) -> bool:
     return auth_type == C.RESULT_SUCCESS or (auth_type ^ 0x01) == 0x04 or (auth_type ^ 0x02) == 0x04
 
 
+def is_hichain_lite(auth_type: int) -> bool:
+    """HiChain Lite: used by device support types 1/2/3 (e.g. the GT 2e)."""
+    return auth_type in (0x01, 0x02)
+
+
+# ---------------------------------------------------------------------------
+# 0x01/0x13 Auth challenge (HiChain Lite)
+# ---------------------------------------------------------------------------
+def auth_request(challenge: bytes, nonce: bytes, auth_algo: int) -> TLV:
+    return TLV().put(0x01, challenge).put(0x02, nonce).put(0x03, bytes([auth_algo]))
+
+
+def auth_nonce(auth_version: int, client_nonce: bytes) -> bytes:
+    return auth_version.to_bytes(2, "big") + client_nonce
+
+
+# ---------------------------------------------------------------------------
+# 0x01/0x0F Bond parameters / 0x01/0x0E Bond (HiChain Lite)
+# ---------------------------------------------------------------------------
+def bond_params_request(serial: bytes, mac: bytes) -> TLV:
+    return (
+        TLV()
+        .put(0x01)
+        .put(0x03, serial)
+        .put(0x04, b"\x02")
+        .put(0x05)
+        .put(0x07, mac)
+        .put(0x09)
+    )
+
+
+def parse_bond_params(tlv: TLV) -> tuple[int, int]:
+    status = tlv.integer(0x01) or 0
+    counter = tlv.integer(0x09) or 0
+    return status, counter & 0xFFFFFFFF
+
+
+def bond_request(serial: bytes, wrapped_key: bytes, iv: bytes) -> TLV:
+    return (
+        TLV()
+        .put(0x01)
+        .put(0x03, b"\x00")
+        .put(0x05, serial)
+        .put(0x06, wrapped_key)
+        .put(0x07, iv)
+    )
+
+
 def _signed(byte: int) -> int:
     return byte - 256 if byte >= 128 else byte
 

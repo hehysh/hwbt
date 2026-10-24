@@ -20,6 +20,7 @@ from hwmusic.crypto import (
     aes_cbc_encrypt,
     aes_gcm_open,
     aes_gcm_seal,
+    digest_lite,
     digest_secret,
     hkdf_sha256,
     hmac_sha256,
@@ -59,6 +60,7 @@ class FakeWatch:
         pin: bytes = b"123456",
         auth_version: int = 3,
         support_type: int = 4,
+        auth_algo: int = 0,
         encrypt_method: int = 1,
         unit_size: int = 200,
         chunk_size: int = 600,
@@ -70,6 +72,7 @@ class FakeWatch:
         self.pin = pin
         self.auth_version = auth_version
         self.support_type = support_type
+        self.auth_algo = auth_algo
         self.encrypt_method = encrypt_method
         self.unit_size = unit_size
         self.chunk_size = chunk_size
@@ -77,6 +80,11 @@ class FakeWatch:
         self.no_encrypt_chunks = no_encrypt_chunks
 
         self.session_key: bytes | None = None
+        self.secret_key: bytes | None = None
+        self.server_nonce = b""
+        self.first_key: bytes | None = None
+        self.lite_client_nonce = b""
+        self.encryption_counter = 0
         self.auth_token = bytes(random.randrange(256) for _ in range(32))
         self.auth_id_peer = b"E" * 32
         self.rand_peer = bytes(random.randrange(256) for _ in range(16))
@@ -163,6 +171,12 @@ class FakeWatch:
             self._pincode()
         elif key == (0x01, 0x28):
             self._hichain(tlv)
+        elif key == (0x01, 0x13):
+            self._lite_auth(tlv)
+        elif key == (0x01, 0x0F):
+            self._lite_bond_params(tlv)
+        elif key == (0x01, 0x0E):
+            self._lite_bond(tlv)
         elif key == (0x01, 0x08):
             self.send(0x01, 0x08, TLV().put(0x01, b"\x5a"))
         elif key == (0x01, 0x07):
@@ -199,6 +213,7 @@ class FakeWatch:
     # -- pairing ---------------------------------------------------------
     def _link_params(self) -> None:
         nonce = bytes(random.randrange(256) for _ in range(16))
+        self.server_nonce = nonce
         tlv = (
             TLV()
             .put(0x01, be16(2))
@@ -206,7 +221,7 @@ class FakeWatch:
             .put(0x03, be16(20))
             .put(0x05, bytes([0x00, self.auth_version]) + nonce)
             .put(0x07, bytes([self.support_type]))
-            .put(0x08, b"\x00")
+            .put(0x08, bytes([self.auth_algo]))
             .put(0x0C, bytes([self.encrypt_method]))
         )
         self.send(0x01, 0x01, tlv, encrypted=False)
@@ -215,7 +230,11 @@ class FakeWatch:
         assert tlv is not None
         self.client_id = tlv.get(0x05) or b""
         udid = b"AB" * 32
-        self.send(0x01, 0x33, TLV().put(0x01, b"\x01").put(0x05, udid), encrypted=False)
+        if self.support_type == 4:
+            self.send(0x01, 0x33, TLV().put(0x01, b"\x01").put(0x05, udid), encrypted=False)
+        else:
+            # HiChain Lite: device support types 1-3 answer with auth type 0x01
+            self.send(0x01, 0x33, TLV().put(0x02, b"\x01").put(0x05, udid), encrypted=False)
 
     def _pincode(self) -> None:
         self.pin_requests += 1
@@ -284,6 +303,54 @@ class FakeWatch:
     def _hichain_reply(self, payload: dict) -> None:
         raw = json.dumps(payload, separators=(",", ":")).encode()
         self.send(0x01, 0x28, TLV().put(0x04, b"\x00").put(0x01, raw), encrypted=False)
+
+    # -- HiChain Lite (device support types 1-3) -------------------------
+    def _lite_auth(self, tlv: TLV | None) -> None:
+        assert tlv is not None
+        challenge = tlv.get(0x01) or b""
+        nonce = tlv.get(0x02) or b""
+        key = self.secret_key if self.auth_version == 0x02 else self.pin
+        self.lite_client_nonce = nonce[2:]
+        double_nonce = self.server_nonce + self.lite_client_nonce
+        expected = digest_lite(
+            b"\x01\x00", key, double_nonce, auth_version=self.auth_version, auth_algo=self.auth_algo
+        )[:32]
+        if challenge != expected:
+            self.send(0x01, 0x13, TLV().put(0x7F, be32(1)), encrypted=False)
+            return
+        self.first_key = digest_lite(
+            b"\x01\x00", key, double_nonce, auth_version=self.auth_version, auth_algo=self.auth_algo
+        )[32:48]
+        answer = digest_lite(
+            b"\x01\x10", key, double_nonce, auth_version=self.auth_version, auth_algo=self.auth_algo
+        )[:32]
+        self.send(0x01, 0x13, TLV().put(0x01, answer), encrypted=False)
+
+    def _lite_bond_params(self, tlv: TLV | None) -> None:
+        assert tlv is not None
+        self.lite_serial = tlv.get(0x03) or b""
+        self.lite_mac = tlv.get(0x07) or b""
+        self.encryption_counter = 0x10203040
+        self.send(
+            0x01,
+            0x0F,
+            TLV().put(0x01, b"\x00").put(0x09, be32(self.encryption_counter)),
+            encrypted=False,
+        )
+
+    def _lite_bond(self, tlv: TLV | None) -> None:
+        assert tlv is not None
+        wrapped = tlv.get(0x06) or b""
+        iv = tlv.get(0x07) or b""
+        assert self.first_key is not None
+        secret = (
+            aes_gcm_open(wrapped, self.first_key, iv)
+            if self.encrypt_method == 1
+            else aes_cbc_decrypt(wrapped, self.first_key, iv)
+        )
+        self.secret_key = secret
+        self.session_key = secret
+        self.send(0x01, 0x0E, TLV(), encrypted=False)
 
     # -- info ------------------------------------------------------------
     def _product_info(self) -> None:

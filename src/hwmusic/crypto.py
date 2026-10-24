@@ -97,6 +97,43 @@ def aes_cbc_decrypt(data: bytes, key: bytes, iv: bytes) -> bytes:
         raise CryptoError("AES-CBC padding error (wrong key/IV?)") from exc
 
 
+# -- HiChain Lite ------------------------------------------------------------
+def hex_upper(data: bytes) -> bytes:
+    """``GB.hexdump``: uppercase hex, no separators, as ASCII bytes."""
+    return data.hex().upper().encode("ascii")
+
+
+def pbkdf2_sha256(password: bytes, salt: bytes, iterations: int, length: int) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password, salt, iterations, dklen=length)
+
+
+def digest_lite(
+    message: bytes, key: bytes, nonce: bytes, *, auth_version: int, auth_algo: int
+) -> bytes:
+    """Gadgetbridge ``HuaweiCrypto.computeDigestHiChainLite``.
+
+    Returns 64 bytes: ``HMAC(step, nonce) || step``. The first 32 bytes are the
+    challenge (or its expected answer), bytes 32..48 become the bonding key.
+    """
+    hash_key = sha256(hex_upper(key))
+    secret = bytearray(digest_secret(auth_version))
+    for index in range(len(secret)):
+        secret[index] ^= hash_key[index]
+    msg = bytes(secret) + message
+    if auth_algo == 0x01:
+        # Java's PBEKeySpec length is in bits: 0x100 bits == 32 bytes.
+        step = pbkdf2_sha256(hex_upper(msg), hex_upper(nonce), 1000, 32)
+    else:
+        step = hmac_sha256(msg, nonce)
+    return hmac_sha256(step, nonce) + step
+
+
+def initialization_vector(counter: int) -> tuple[bytes, int]:
+    """IV for CBC transport encryption: 12 random bytes plus a BE32 counter."""
+    counter = 1 if counter == 0xFFFFFFFF else counter + 1
+    return random_bytes(12) + counter.to_bytes(4, "big"), counter
+
+
 def ordered_json(value: OrderedDictish) -> bytes:
     """Serialise with insertion order preserved and compact separators.
 
