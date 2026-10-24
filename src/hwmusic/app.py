@@ -17,6 +17,27 @@ from .transport import BleTransport, ScanResult, scan
 LogFn = Callable[[str, str], None]
 EventFn = Callable[[str, dict], None]
 
+_BOND_HINT = (
+    "手表拒绝了这次写入（Write Not Permitted）：它要求先和电脑完成系统级蓝牙配对，"
+    "或者它仍然绑在手机上。\n"
+    "请依次确认：\n"
+    "1) 手机：华为运动健康 → 设备 → 断开连接；仍不行就「解除配对」。\n"
+    "2) 电脑：设置 → 蓝牙和其他设备 → 添加设备 → 蓝牙 → 选中手表完成配对"
+    "（手表上如弹出提示请确认）。\n"
+    "3) 回到本工具点「连接」。\n"
+    "原始错误："
+)
+
+
+def describe_connection_error(exc: BaseException) -> str:
+    """Turn cryptic WinRT/BlueZ errors into something actionable."""
+    lowered = str(exc).lower()
+    if "not permitted" in lowered or "insufficient" in lowered or "0x80070005" in lowered:
+        return _BOND_HINT + str(exc)
+    if isinstance(exc, SessionError):
+        return str(exc)
+    return f"连接失败：{exc}"
+
 
 @dataclass(slots=True)
 class DeviceInfo:
@@ -44,6 +65,26 @@ class MusicApp:
         self.info = DeviceInfo()
 
     # ------------------------------------------------------------------
+    async def _pair_session(self, address: str, *, force_pair: bool) -> None:
+        if self.session is None:
+            raise SessionError("尚未连接手表")
+        token = None if force_pair else self.settings.token_for(address)
+        try:
+            await self.session.pair(saved_token=token, token_saver=lambda t: self._save_token(address, t))
+        except CryptoError as exc:
+            if token is None:
+                raise SessionError(str(exc)) from exc
+            self._log("error", f"已保存的配对密钥失效（{exc}），重新配对…")
+            self._save_token(address, None)
+            await self.session.pair(token_saver=lambda t: self._save_token(address, t))
+        except SessionError as exc:
+            if token is not None and "超时" in str(exc):
+                self._log("error", "使用已保存密钥连接超时，尝试完整配对…")
+                self._save_token(address, None)
+                await self.session.pair(token_saver=lambda t: self._save_token(address, t))
+            else:
+                raise
+
     async def scan(self, timeout: float = 8.0, show_all: bool = False) -> list[ScanResult]:
         return await scan(timeout, show_all=show_all)
 
@@ -71,22 +112,10 @@ class MusicApp:
         )
         await self.session.start()
 
-        token = None if force_pair else self.settings.token_for(address)
         try:
-            await self.session.pair(saved_token=token, token_saver=lambda t: self._save_token(address, t))
-        except CryptoError as exc:
-            if token is None:
-                raise SessionError(str(exc)) from exc
-            self._log("error", f"已保存的配对密钥失效（{exc}），重新配对…")
-            self._save_token(address, None)
-            await self.session.pair(token_saver=lambda t: self._save_token(address, t))
-        except SessionError as exc:
-            if token is not None and "超时" in str(exc):
-                self._log("error", "使用已保存密钥连接超时，尝试完整配对…")
-                self._save_token(address, None)
-                await self.session.pair(token_saver=lambda t: self._save_token(address, t))
-            else:
-                raise
+            await self._pair_session(address, force_pair=force_pair)
+        except Exception as exc:  # noqa: BLE001 - surface backend errors with a hint
+            raise SessionError(describe_connection_error(exc)) from exc
 
         self.settings.last_address = address
         self.settings.last_name = name
