@@ -44,7 +44,9 @@ def test_auth_error_detection() -> None:
     assert _is_auth_error(Exception("Insufficient authentication"))
     assert _is_auth_error(Exception("GATT protocol error 0x05"))
     assert _is_auth_error(Exception("WinError 0x80070005"))
-    assert _is_auth_error(Exception("Write not permitted"))
+    # ATT 0x03 is a write-type mismatch, not a missing bond: pairing would only
+    # push the watch into Huawei Health's QR-code flow.
+    assert not _is_auth_error(Exception("Write not permitted"))
     assert not _is_auth_error(Exception("Characteristic not found"))
 
 
@@ -110,3 +112,108 @@ async def test_start_notify_pairs_then_retries() -> None:
     await transport.start_notify(lambda _data: None)
     assert client.paired is True
     assert client.calls == 2
+
+
+class _Characteristic:
+    def __init__(self, properties: list[str]) -> None:
+        self.properties = properties
+
+
+class _Services:
+    def __init__(self, characteristic: _Characteristic | None) -> None:
+        self._characteristic = characteristic
+
+    def get_characteristic(self, _uuid: str) -> _Characteristic | None:
+        return self._characteristic
+
+
+class _GattClient:
+    """Fake FE01 that only accepts write-without-response, like the GT 2e."""
+
+    def __init__(self, properties: list[str], mtu: int = 247) -> None:
+        self.mtu_size = mtu
+        self.is_connected = True
+        self.services = _Services(_Characteristic(properties))
+        self.writes: list[bool] = []
+        self.pair_calls = 0
+
+    async def write_gatt_char(self, _uuid: str, _data: bytes, response: bool = True) -> None:
+        self.writes.append(response)
+        if response and "write" not in self.services._characteristic.properties:  # type: ignore[union-attr]
+            raise BleakError("(3, 'GATT Protocol Error: Write Not Permitted')")
+
+    async def pair(self) -> bool:
+        self.pair_calls += 1
+        return True
+
+
+def test_write_type_follows_characteristic_properties() -> None:
+    transport = BleTransport("AA:BB")
+    transport._client = _GattClient(["write-without-response", "notify"])  # type: ignore[assignment]
+    transport._apply_write_type()
+    assert transport.use_response is False
+    assert transport.write_properties == ["write-without-response", "notify"]
+
+
+def test_write_type_keeps_user_choice_when_both_are_supported() -> None:
+    transport = BleTransport("AA:BB")
+    transport._client = _GattClient(["write", "write-without-response"])  # type: ignore[assignment]
+    transport._apply_write_type()
+    assert transport.use_response is True
+
+
+def test_write_type_forces_response_when_only_write_is_supported() -> None:
+    transport = BleTransport("AA:BB")
+    transport.use_response = False
+    transport._client = _GattClient(["write"])  # type: ignore[assignment]
+    transport._apply_write_type()
+    assert transport.use_response is True
+
+
+def test_missing_characteristic_keeps_defaults() -> None:
+    transport = BleTransport("AA:BB")
+    client = _GattClient([])
+    client.services = _Services(None)
+    transport._client = client  # type: ignore[assignment]
+    transport._apply_write_type()
+    assert transport.use_response is True
+    assert transport.write_properties == []
+
+
+@pytest.mark.asyncio
+async def test_write_switches_to_without_response_on_not_permitted() -> None:
+    transport = BleTransport("AA:BB")
+    client = _GattClient(["write-without-response"])
+    transport._client = client  # type: ignore[assignment]
+    await transport.write(b"\x5a\x00\x01\x00")
+    assert client.writes == [True, False]
+    assert transport.use_response is False
+    # ATT 0x03 must never trigger an OS-level bond (that enters the QR flow).
+    assert client.pair_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_write_uses_the_learned_type_next_time() -> None:
+    transport = BleTransport("AA:BB")
+    client = _GattClient(["write-without-response"])
+    transport._client = client  # type: ignore[assignment]
+    await transport.write(b"\x5a")
+    await transport.write(b"\x5b")
+    assert client.writes == [True, False, False]
+
+
+@pytest.mark.asyncio
+async def test_write_raises_when_both_types_fail() -> None:
+    transport = BleTransport("AA:BB")
+
+    class _AlwaysRejects(_GattClient):
+        async def write_gatt_char(self, _uuid: str, _data: bytes, response: bool = True) -> None:
+            self.writes.append(response)
+            raise BleakError("(3, 'GATT Protocol Error: Write Not Permitted')")
+
+    client = _AlwaysRejects(["write", "write-without-response"])
+    transport._client = client  # type: ignore[assignment]
+    with pytest.raises(BleakError):
+        await transport.write(b"\x5a")
+    assert client.writes == [True, False]
+    assert client.pair_calls == 0

@@ -387,6 +387,13 @@ class MainWindow(QMainWindow):
         if not devices:
             self.statusBar().showMessage("没有发现设备")
             self.append_log("warn", "没有扫描到华为手表：请确认蓝牙已开启、手表在附近且未连接手机")
+            if self.settings.last_address:
+                label = f"{self.settings.last_name or '上次的设备'}  ({self.settings.last_address})"
+                self.device_combo.addItem(label, self.settings.last_address)
+                self.append_log(
+                    "info",
+                    "手表可能已与 Windows 配对/连接而停止广播。可直接点「连接」尝试上次的地址。",
+                )
             return
         for device in devices:
             self.device_combo.addItem(device.label(), device.address)
@@ -408,7 +415,7 @@ class MainWindow(QMainWindow):
             return
         name = self.device_combo.currentText()
         self._set_busy(True, "正在连接…")
-        self.statusBar().showMessage("正在连接手表，若手表弹出配对提示请点确认…")
+        self.statusBar().showMessage("正在连接手表…（不需要在 Windows 里配对手表）")
 
         async def _connect():
             if force_pair:

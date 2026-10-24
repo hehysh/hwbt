@@ -24,17 +24,30 @@ _AUTH_ERROR_TOKENS = (
     "insufficient",
     "authenticat",
     "encrypt",
-    "not permitted",
     "not authorized",
     "0x80070005",
     "protocol error 0x05",
     "protocol error 0x0f",
 )
 
+# ATT 0x03 "Write Not Permitted": the characteristic does not accept the write
+# type we used (Write Request vs. Write Command). Huawei's FE01 is usually
+# write-without-response only, so a Write Request is rejected outright.
+_WRITE_TYPE_ERROR_TOKENS = (
+    "write not permitted",
+    "not permitted",
+    "0x03",
+)
+
 
 def _is_auth_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     return any(token in message for token in _AUTH_ERROR_TOKENS)
+
+
+def _is_write_type_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return any(token in message for token in _WRITE_TYPE_ERROR_TOKENS)
 
 
 @dataclass(slots=True)
@@ -83,6 +96,7 @@ class BleTransport:
         self.name = name
         self.max_write_size = C.DEFAULT_SLICE_SIZE
         self.use_response = True
+        self.write_properties: list[str] = []
         self._client: BleakClient | None = None
         self._callback: Callable[[bytes], None] | None = None
         self._disconnect_cb: Callable[[], None] | None = None
@@ -134,6 +148,38 @@ class BleTransport:
         if not self._client.is_connected:
             raise BleakError("connect() returned without an active link")
         self._apply_mtu()
+        self._apply_write_type()
+
+    def _apply_write_type(self) -> None:
+        """Pick the write type the FE01 characteristic actually advertises.
+
+        A BLE characteristic can support Write Request (``write``), Write
+        Command (``write-without-response``), or both. Sending the wrong one
+        makes the watch answer ATT 0x03 "Write Not Permitted", which looks like
+        a pairing problem but is not.
+        """
+        client = self._client
+        if client is None:
+            return
+        characteristic = None
+        try:
+            characteristic = client.services.get_characteristic(C.WRITE_UUID)
+        except Exception:  # noqa: BLE001 - services may not be resolved yet
+            LOG.debug("could not look up %s", C.WRITE_UUID, exc_info=True)
+        if characteristic is None:
+            self._status("未能读取 FE01 特征属性，先按默认写入方式尝试")
+            return
+        props = [str(item).lower() for item in (characteristic.properties or [])]
+        self.write_properties = props
+        self._status(f"FE01 特征属性：{', '.join(props) if props else '未知'}")
+        with_response = "write" in props
+        without_response = "write-without-response" in props
+        if without_response and not with_response:
+            if self.use_response:
+                self._status("FE01 只支持无响应写入，已自动切换为无响应写入")
+            self.use_response = False
+        elif with_response and not without_response:
+            self.use_response = True
 
     def _apply_mtu(self) -> None:
         """Size frames to the negotiated ATT MTU when the OS reports it."""
@@ -189,16 +235,32 @@ class BleTransport:
             self._client = None
 
     # -- io -------------------------------------------------------------
+    async def _write_once(self, data: bytes) -> None:
+        client = self._client
+        if client is None:
+            raise BleakError("蓝牙连接已断开")
+        await client.write_gatt_char(C.WRITE_UUID, data, response=self.use_response)
+
     async def write(self, data: bytes) -> None:
         if self._client is None or not self._client.is_connected:
             raise BleakError("蓝牙连接已断开")
         if len(data) > self.max_write_size:
             raise SliceTooLarge(f"frame {len(data)}B > negotiated {self.max_write_size}B")
         try:
-            await self._client.write_gatt_char(C.WRITE_UUID, data, response=self.use_response)
+            await self._write_once(data)
+            return
         except BleakError as exc:
+            if _is_write_type_error(exc):
+                self.use_response = not self.use_response
+                kind = "带响应" if self.use_response else "无响应"
+                self._status(f"写入被拒（{exc}），改用{kind}写入重试…")
+                try:
+                    await self._write_once(data)
+                    return
+                except BleakError as retry_exc:
+                    exc = retry_exc
             if await self._recover_auth(exc):
-                await self._client.write_gatt_char(C.WRITE_UUID, data, response=self.use_response)
+                await self._write_once(data)
                 return
             message = str(exc).lower()
             if any(token in message for token in ("too long", "length", "attr", "mtu", "invalid")):

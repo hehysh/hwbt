@@ -17,10 +17,20 @@ from .transport import BleTransport, ScanResult, scan
 LogFn = Callable[[str, str], None]
 EventFn = Callable[[str, dict], None]
 
+_WRITE_HINT = (
+    "手表拒绝了这次写入（ATT 0x03 Write Not Permitted）。程序已经在「带响应 / 无响应」"
+    "两种写入方式之间自动切换重试，仍然失败，通常不是配对问题。请依次检查：\n"
+    "1) 手机：华为运动健康 → 设备 → 断开连接；仍不行就「解除配对」。\n"
+    "2) 手表：不要停在「连接新手机」的二维码界面，按上键回到表盘。\n"
+    "3) 电脑：不要在 Windows 蓝牙设置里配对手表——GT 2e 会因此进入二维码模式并停止广播，"
+    "本程序会自己完成华为的配对。若之前配过对，请在「设置 → 蓝牙和其他设备」里删除该手表，"
+    "再重启手表重试。\n"
+    "4) 勾选「调试日志」后重连并导出日志，里面会记录 FE01 特征的写入属性。\n"
+    "原始错误："
+)
+
 _BOND_HINT = (
-    "手表拒绝了这次写入（Write Not Permitted）：它要求先和电脑完成系统级蓝牙配对，"
-    "或者它仍然绑在手机上。\n"
-    "请依次确认：\n"
+    "手表要求先完成蓝牙加密（系统级配对）。请依次确认：\n"
     "1) 手机：华为运动健康 → 设备 → 断开连接；仍不行就「解除配对」。\n"
     "2) 电脑：设置 → 蓝牙和其他设备 → 添加设备 → 蓝牙 → 选中手表完成配对"
     "（手表上如弹出提示请确认）。\n"
@@ -32,7 +42,9 @@ _BOND_HINT = (
 def describe_connection_error(exc: BaseException) -> str:
     """Turn cryptic WinRT/BlueZ errors into something actionable."""
     lowered = str(exc).lower()
-    if "not permitted" in lowered or "insufficient" in lowered or "0x80070005" in lowered:
+    if "not permitted" in lowered or "0x03" in lowered:
+        return _WRITE_HINT + str(exc)
+    if "insufficient" in lowered or "0x80070005" in lowered:
         return _BOND_HINT + str(exc)
     if isinstance(exc, SessionError):
         return str(exc)
