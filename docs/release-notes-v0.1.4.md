@@ -45,4 +45,4 @@ v0.1.3 之前有两处浪费：
 
 `HuaweiMusic.exe`（单文件，免安装）
 
-SHA-256：`PENDING`
+SHA-256：`71c89bfa940b8f03a370fecf2fa859c88329eb7495ee6dec825074fd671c75cd`
