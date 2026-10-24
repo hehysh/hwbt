@@ -549,6 +549,9 @@ class HuaweiSession:
             future=future,
             last_activity=loop.time(),
         )
+        watchdog = asyncio.ensure_future(self._upload_watchdog(self._upload))
+        self._tasks.add(watchdog)
+        watchdog.add_done_callback(self._tasks.discard)
         try:
             self._log("info", f"上传 {file_name}（{len(data) / 1024:.0f} KB）…")
             response = await self.request(
@@ -565,7 +568,19 @@ class HuaweiSession:
         except asyncio.TimeoutError as exc:
             raise SessionError("上传超时：手表长时间没有请求数据") from exc
         finally:
+            watchdog.cancel()
             self._upload = None
+
+    async def _upload_watchdog(self, state: UploadState) -> None:
+        """Fail the upload when the watch stops asking for data."""
+        loop = asyncio.get_running_loop()
+        while self._upload is state and not state.future.done():
+            await asyncio.sleep(5.0)
+            if self._upload is not state or state.future.done():
+                return
+            if loop.time() - state.last_activity > 60.0:
+                self._fail_upload(SessionError("上传超时：手表 60 秒没有请求数据"))
+                return
 
     def _handle_upload(self, command: int, tlv: TLV) -> None:
         state = self._upload
