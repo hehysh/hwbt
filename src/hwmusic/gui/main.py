@@ -176,6 +176,11 @@ class MainWindow(QMainWindow):
         self._force_pair = False
         self._log_path = config_dir() / "app.log"
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            if self._log_path.exists() and self._log_path.stat().st_size > 2 * 1024 * 1024:
+                self._log_path.replace(self._log_path.with_suffix(".log.1"))
+        except OSError:
+            pass
 
         self.setWindowTitle(f"{C.APP_DISPLAY_NAME} {__version__}")
         self.resize(940, 780)
@@ -425,6 +430,9 @@ class MainWindow(QMainWindow):
         self.append_log("ok", f"已连接 {info.name or ''}")
 
     def disconnect_device(self) -> None:
+        if self.uploading:
+            QMessageBox.information(self, "正在上传", "请等待上传完成后再断开。")
+            return
         self._set_busy(True, "正在断开…")
 
         async def _disconnect():
@@ -453,8 +461,6 @@ class MainWindow(QMainWindow):
             "将删除本机保存的配对密钥并重新配对。\n手表上可能会出现确认提示，需要点“确认”。\n\n继续吗？",
         )
         if answer == QMessageBox.StandardButton.Yes:
-            if self.connected:
-                self.disconnect_device()
             self.connect_device(force_pair=True)
 
     def refresh_storage(self) -> None:
@@ -692,6 +698,9 @@ class MainWindow(QMainWindow):
         self.btn_clear.setEnabled(has_files and not self.uploading)
         self.btn_refresh.setEnabled(self.connected and not self.uploading)
         self.btn_songs.setEnabled(self.connected and not self.uploading)
+        self.btn_scan.setEnabled(not self.uploading)
+        self.btn_connect.setEnabled(not self.uploading)
+        self.btn_pair.setEnabled(not self.uploading)
         self.btn_connect.setText("断开" if self.connected else "连接")
 
     @staticmethod

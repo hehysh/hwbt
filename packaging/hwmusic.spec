@@ -67,5 +67,5 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     icon=os.path.join(ROOT, "packaging", "icon.ico"),
-    version=None,
+    version=os.path.join(ROOT, "packaging", "version_info.txt"),
 )
