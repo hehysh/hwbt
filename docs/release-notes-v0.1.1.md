@@ -25,6 +25,12 @@ README 的使用方法新增「在 Windows 里先配对一次」这一步，FAQ 
 3. 电脑：设置 → 蓝牙和其他设备 → 添加设备 → 蓝牙 → 选中手表配对。
 4. 打开本程序 → 扫描 → 连接。
 
+## 下载
+
+`HuaweiMusic.exe`（单文件，免安装）
+
+SHA-256：`b39d6e787cabfeb6b527dc20d490b9514eb546cb5d9fbd0db82060b79fb4f8d4`
+
 ## 说明
 
 - GT 2e 属于 lite wearable 协议，理论上与 GT2/GT3/GT4 同一套流程，但尚未在真机上完成一次完整上传。
