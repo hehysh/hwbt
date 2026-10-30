@@ -46,4 +46,4 @@ MTU 早就不是瓶颈了（GT 2e 报的是 514）。Android 上的官方 App �
 
 `HuaweiMusic.exe`（单文件，免安装）
 
-SHA-256：`PENDING`
+SHA-256：`c4c8a68e4df9ab13f73d5fd447b64f33546502cba2270f15ae935578184cf964`
