@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 from bleak.exc import BleakError
 
-from hwmusic.transport import BleTransport, _is_auth_error, _looks_like_huawei
+from hwmusic import transport as transport_module
+from hwmusic.transport import (
+    BleTransport,
+    _describe_conn_params,
+    _is_auth_error,
+    _looks_like_huawei,
+)
 
 
 class _FakeClient:
@@ -224,3 +230,94 @@ async def test_write_raises_when_both_types_fail() -> None:
         await transport.write(b"\x5a")
     assert client.writes == [True, False]
     assert client.pair_calls == 0
+
+
+class _FakeParams:
+    min_connection_interval = 9  # 11.25 ms
+    max_connection_interval = 12  # 15 ms
+    connection_latency = 0
+    link_timeout = 500  # 5000 ms
+
+
+class _FakeRequest:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _FakeDevice:
+    def __init__(self, fail: bool = False) -> None:
+        self.fail = fail
+        self.requested: list[object] = []
+
+    def request_preferred_connection_parameters(self, params: object) -> _FakeRequest:
+        if self.fail:
+            raise OSError("unsupported")
+        self.requested.append(params)
+        return _FakeRequest()
+
+
+def _win_transport(device: _FakeDevice) -> BleTransport:
+    transport = BleTransport("AA:BB")
+    transport._client = type("C", (), {"_requester": device})()  # type: ignore[assignment]
+    return transport
+
+
+def test_describe_conn_params_uses_1_25ms_units() -> None:
+    text = _describe_conn_params(_FakeParams())
+    assert "11.25–15.00 ms" in text
+    assert "5000 ms" in text
+
+
+def test_high_throughput_is_skipped_outside_windows() -> None:
+    transport = _win_transport(_FakeDevice())
+    transport._request_high_throughput()
+    assert transport.high_throughput is False
+
+
+def test_high_throughput_request_is_kept_alive(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transport_module.sys, "platform", "win32")
+    monkeypatch.setattr(transport_module, "_winrt_throughput_params", lambda: _FakeParams())
+    device = _FakeDevice()
+    transport = _win_transport(device)
+
+    transport._request_high_throughput()
+
+    assert transport.high_throughput is True
+    assert len(device.requested) == 1
+    assert isinstance(device.requested[0], _FakeParams)
+    # The request object must stay referenced, otherwise WinRT drops it.
+    assert transport._conn_params_request is not None
+
+    transport._release_high_throughput()
+    assert transport.high_throughput is False
+    assert transport._conn_params_request is None
+
+
+def test_high_throughput_failure_does_not_break_the_link(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transport_module.sys, "platform", "win32")
+    monkeypatch.setattr(transport_module, "_winrt_throughput_params", lambda: _FakeParams())
+    messages: list[str] = []
+    transport = _win_transport(_FakeDevice(fail=True))
+    transport.on_status = messages.append
+
+    transport._request_high_throughput()
+
+    assert transport.high_throughput is False
+    assert any("失败" in message for message in messages)
+
+
+def test_high_throughput_is_skipped_when_the_api_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(transport_module.sys, "platform", "win32")
+    monkeypatch.setattr(transport_module, "_winrt_throughput_params", lambda: None)
+    device = _FakeDevice()
+    transport = _win_transport(device)
+
+    transport._request_high_throughput()
+
+    assert transport.high_throughput is False
+    assert device.requested == []

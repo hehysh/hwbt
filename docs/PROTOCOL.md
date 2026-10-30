@@ -158,6 +158,17 @@ fileId (1) | index (1) | offset (BE32) | data (unitSize 字节)
   手机侧只能把这一段尽量连续地写出去（本项目按窗口并发提交写入，失败时退回逐帧发送）。
 - 手表没有“中止上传”命令。取消上传时只能停止发送并丢弃后续的 `0x28/0x05`，
   手表通常要等自己的超时才会恢复；残留的未完成文件由手表自行丢弃或留给用户删除。
+- 真正决定吞吐的是**连接间隔**，不是 MTU。手表的 `0x28/0x05` 一次往返只能换来一段数据，
+  每帧写入又都要等下一个连接事件；间隔 30ms 时，即使 MTU 514 也只有十几 KB/s。
+  Android 上的官方 App 调用 `BluetoothGatt.requestConnectionPriority(CONNECTION_PRIORITY_HIGH)`
+  把间隔压到 11.25–15ms；Windows 11 的等价 API 是
+  `BluetoothLEDevice.RequestPreferredConnectionParameters(ThroughputOptimized)`
+  （UniversalApiContract v14），本项目在连接后立即请求，断开时释放。
+- 写入类型同样关键：`Write Request`（带响应）每个连接事件只能发一包，
+  `Write Command`（无响应）可以连发多包。FE01 支持无响应写入时，开启「快速模式」能再快几倍。
+- 每个 `0x28/0x06` 只能携带一个 `unitSize` 的数据，所以单帧利用率 =
+  `unitSize / min(手表分片, MTU - 3)`。`unitSize` 明显小于 MTU 时，剩下的空间是浪费的，
+  但协议要求按手表的 `unitSize` 切分，不能自行合并。
 
 失败时手表发 `0x28/0x08`，`0x7F` 为错误码：
 

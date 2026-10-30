@@ -67,6 +67,7 @@ class LinkInfo:
     def describe(self) -> str:
         return (
             f"协议 v{self.protocol_version}, 分片 {self.slice_size}B, "
+            f"手表 MTU {self.mtu}B, "
             f"认证 v{self.auth_version}, 设备类型 {self.device_support_type}, "
             f"{'AES-GCM' if self.uses_gcm else 'AES-CBC'}"
         )

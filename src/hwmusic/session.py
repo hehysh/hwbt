@@ -79,6 +79,7 @@ class UploadState:
     sent: int = 0
     last_report: float = 0.0
     reported_bytes: int = 0
+    chunks: int = 0
 
 
 class HuaweiSession:
@@ -110,7 +111,7 @@ class HuaweiSession:
         # operations anyway, but not awaiting each completion lets the stack
         # pack several write commands into one connection event, which is
         # where most of the upload time goes.
-        self.write_window = 8
+        self.write_window = 16
         self._upload: UploadState | None = None
         self._chunk_task: asyncio.Task | None = None
         self._music_metadata: dict[str, tuple[str, str]] = {}
@@ -712,6 +713,13 @@ class HuaweiSession:
         watchdog.add_done_callback(self._tasks.discard)
         try:
             self._log("info", f"上传 {file_name}（{len(data) / 1024:.0f} KB）…")
+            self._log(
+                "info",
+                f"发送通道: 单帧 {self._slice_size()}B"
+                f"（{'带响应' if self.transport.use_response else '无响应'}写入，"
+                f"窗口 {self.write_window} 帧，"
+                f"{'已请求高吞吐连接参数' if getattr(self.transport, 'high_throughput', False) else '系统默认连接参数'}）",
+            )
             response = await self.request(
                 C.SERVICE_FILE_UPLOAD,
                 C.UPLOAD_CMD_INFO,
@@ -788,7 +796,8 @@ class HuaweiSession:
             self._log(
                 "info",
                 f"传输参数: 单元 {state.unit_size}B，"
-                f"{'不额外加密' if not state.encrypt else '分块加密'}",
+                f"{'不额外加密' if not state.encrypt else '分块加密'}，"
+                f"单帧上限 {self._slice_size()}B",
             )
             self._log(
                 "debug",
@@ -877,6 +886,18 @@ class HuaweiSession:
                     sliced=len(body) + 8 > self._slice_size(),
                 )
             )
+        if self.debug and state.chunks < 3:
+            # Shows how much of each ATT write is real payload: if the watch
+            # asks for 200-byte units but the link allows 514, we can never
+            # fill a packet and the round trips, not the MTU, are the limit.
+            air = sum(len(frame) for frame in frames)
+            self._log(
+                "debug",
+                f"数据块: {len(chunk)}B → {len(payloads)} 个单元 / {len(frames)} 帧，"
+                f"平均 {air / max(1, len(frames)):.0f}B/帧"
+                f"（单帧上限 {self._slice_size()}B）",
+            )
+        state.chunks += 1
         await self._write_all(frames)
 
     def _fail_upload(self, error: Exception) -> None:

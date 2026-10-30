@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -48,6 +49,47 @@ def _is_auth_error(exc: BaseException) -> bool:
 def _is_write_type_error(exc: BaseException) -> bool:
     message = str(exc).lower()
     return any(token in message for token in _WRITE_TYPE_ERROR_TOKENS)
+
+
+def _winrt_throughput_params() -> object | None:
+    """Return WinRT's ``ThroughputOptimized`` parameters, or ``None``.
+
+    Split out so the Windows-only import is easy to stub in tests and so a
+    missing API (anything before Windows 11) is a plain ``None``.
+    """
+    try:
+        from winrt.windows.devices.bluetooth import (
+            BluetoothLEPreferredConnectionParameters as Params,
+        )
+    except Exception:  # noqa: BLE001 - not on Windows, or too old
+        return None
+    preferred = getattr(Params, "throughput_optimized", None)
+    if preferred is None:
+        preferred = getattr(Params, "ThroughputOptimized", None)
+    return preferred
+
+
+def _describe_conn_params(params: object) -> str:
+    """Render WinRT connection parameters in milliseconds (1.25 ms units)."""
+    def number(name: str) -> float | None:
+        try:
+            value = getattr(params, name)
+        except Exception:  # noqa: BLE001 - property may be missing
+            return None
+        return value if isinstance(value, (int, float)) else None
+
+    low = number("min_connection_interval")
+    high = number("max_connection_interval")
+    if low is None or high is None:
+        return "间隔由系统决定"
+    text = f"间隔 {low * 1.25:.2f}–{high * 1.25:.2f} ms"
+    latency = number("connection_latency")
+    if latency is not None:
+        text += f"，延迟 {int(latency)} 个事件"
+    timeout = number("link_timeout")
+    if timeout is not None:
+        text += f"，超时 {timeout * 10:.0f} ms"
+    return text
 
 
 @dataclass(slots=True)
@@ -101,6 +143,10 @@ class BleTransport:
         self._callback: Callable[[bytes], None] | None = None
         self._disconnect_cb: Callable[[], None] | None = None
         self._closed = False
+        # Kept alive for as long as the link is up: WinRT drops the request as
+        # soon as the object is garbage collected.
+        self._conn_params_request: object | None = None
+        self.high_throughput = False
         # Optional human-readable progress hook (the GUI shows these lines).
         self.on_status: Callable[[str], None] | None = None
 
@@ -153,6 +199,61 @@ class BleTransport:
         await asyncio.sleep(0.2)
         self._apply_mtu()
         self._apply_write_type()
+        self._request_high_throughput()
+
+    # -- link parameters ------------------------------------------------
+    def _request_high_throughput(self) -> None:
+        """Ask Windows for a short connection interval during the transfer.
+
+        The watch drives the upload: it asks for a chunk, we write it, it asks
+        for the next one. Between those two requests the link sits idle for a
+        whole connection interval, and every write waits for the next
+        connection event. Windows' default ("balanced") policy uses a long
+        interval, which is why a BLE upload can crawl at ~10 KB/s even with a
+        514-byte MTU. Android's own app calls
+        ``requestConnectionPriority(CONNECTION_PRIORITY_HIGH)`` for exactly
+        this reason; on Windows 11 the equivalent is
+        ``RequestPreferredConnectionParameters(ThroughputOptimized)``.
+
+        This is a hint: the watch may refuse it, and older Windows versions do
+        not have the API at all. Either way the upload still works.
+        """
+        if sys.platform != "win32":
+            return
+        device = getattr(self._client, "_requester", None)
+        if device is None:
+            return
+        preferred = _winrt_throughput_params()
+        if preferred is None:
+            self._status("当前 Windows 不支持请求高吞吐蓝牙连接参数，保持系统默认")
+            return
+        try:
+            request = getattr(device, "request_preferred_connection_parameters", None)
+            if request is None:
+                request = device.RequestPreferredConnectionParameters  # type: ignore[attr-defined]
+            self._conn_params_request = request(preferred)
+        except Exception as exc:  # noqa: BLE001 - a hint must never break the link
+            self._status(f"请求高吞吐蓝牙连接参数失败：{exc}（保持系统默认，不影响上传）")
+            return
+        self.high_throughput = True
+        self._status(f"已请求高吞吐蓝牙连接参数：{_describe_conn_params(preferred)}")
+        LOG.info("requested throughput-optimized connection parameters")
+
+    def _release_high_throughput(self) -> None:
+        """Drop the request so Windows can go back to its power-friendly policy."""
+        request, self._conn_params_request = self._conn_params_request, None
+        self.high_throughput = False
+        if request is None:
+            return
+        for name in ("close", "Close"):
+            closer = getattr(request, name, None)
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:  # noqa: BLE001 - best effort
+                LOG.debug("could not release connection parameter request", exc_info=True)
+            return
 
     def _apply_write_type(self) -> None:
         """Pick the write type the FE01 characteristic actually advertises.
@@ -184,6 +285,11 @@ class BleTransport:
             self.use_response = False
         elif with_response and not without_response:
             self.use_response = True
+        elif with_response and without_response and self.use_response:
+            # Each write-with-response costs a full round trip, so the upload
+            # can only ever send one packet per connection interval. Fast mode
+            # removes that wait and is usually several times faster.
+            self._status("FE01 支持无响应写入；开启「快速模式」可明显提速")
 
     def _apply_mtu(self) -> None:
         """Size frames to the negotiated ATT MTU when the OS reports it."""
@@ -235,6 +341,7 @@ class BleTransport:
 
     async def disconnect(self) -> None:
         self._closed = True
+        self._release_high_throughput()
         if self._client is not None:
             try:
                 if self._client.is_connected:
