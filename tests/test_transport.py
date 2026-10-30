@@ -271,10 +271,13 @@ def test_describe_conn_params_uses_1_25ms_units() -> None:
     assert "5000 ms" in text
 
 
-def test_high_throughput_is_skipped_outside_windows() -> None:
-    transport = _win_transport(_FakeDevice())
+def test_high_throughput_is_skipped_outside_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(transport_module.sys, "platform", "linux")
+    device = _FakeDevice()
+    transport = _win_transport(device)
     transport._request_high_throughput()
     assert transport.high_throughput is False
+    assert device.requested == []
 
 
 def test_high_throughput_request_is_kept_alive(monkeypatch: pytest.MonkeyPatch) -> None:
