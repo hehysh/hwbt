@@ -45,4 +45,4 @@ hwmusic songs -o songs.txt   # 顺便导出
 
 `HuaweiMusic.exe`（单文件，免安装）
 
-SHA-256：`PENDING`
+SHA-256：`ffbc652b03cd0a16a900add3a292e4f8456ad3d107608038b6bce3aa442f7045`
