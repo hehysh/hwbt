@@ -37,6 +37,7 @@ from .. import __version__
 from .. import constants as C
 from ..app import DeviceInfo
 from ..metadata import Track, is_supported, read_track
+from ..songlist import render_song_list
 from ..store import Settings, config_dir
 from .worker import AsyncWorker
 
@@ -117,8 +118,10 @@ class DropZone(QFrame):
 class WatchSongsDialog(QDialog):
     """Read-only list of the songs stored on the watch."""
 
-    def __init__(self, parent: QWidget | None, songs: list) -> None:
+    def __init__(self, parent: QWidget | None, songs: list, *, device: str = "") -> None:
         super().__init__(parent)
+        self.songs = list(songs)
+        self.device = device
         self.setWindowTitle("手表上的歌曲")
         self.resize(620, 420)
         layout = QVBoxLayout(self)
@@ -147,12 +150,39 @@ class WatchSongsDialog(QDialog):
                 table.setItem(row, column, QTableWidgetItem(value))
         layout.addWidget(table, 1)
 
+        self.btn_export = QPushButton("导出 TXT")
+        self.btn_export.setObjectName("primary")
+        self.btn_export.setEnabled(bool(self.songs))
+        self.btn_export.clicked.connect(self.export_txt)
         close = QPushButton("关闭")
         close.clicked.connect(self.accept)
         row = QHBoxLayout()
         row.addStretch(1)
+        row.addWidget(self.btn_export)
         row.addWidget(close)
         layout.addLayout(row)
+
+    def default_file_name(self) -> str:
+        return f"手表歌曲-{_dt.datetime.now():%Y%m%d-%H%M}.txt"
+
+    def export_txt(self) -> None:
+        if not self.songs:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出歌曲列表", self.default_file_name(), "文本文件 (*.txt);;所有文件 (*)"
+        )
+        if not path:
+            return
+        text = render_song_list(self.songs, device=self.device)
+        try:
+            # utf-8-sig + CRLF so Notepad shows Chinese correctly.
+            Path(path).write_text(text, encoding="utf-8-sig", newline="\r\n")
+        except OSError as exc:
+            QMessageBox.warning(self, "导出失败", f"无法写入文件：\n{exc}")
+            return
+        QMessageBox.information(
+            self, "导出完成", f"已导出 {len(self.songs)} 首歌曲到：\n{path}"
+        )
 
 
 class MainWindow(QMainWindow):
@@ -173,6 +203,7 @@ class MainWindow(QMainWindow):
         self.tracks: list[Track] = []
         self.connected = False
         self.uploading = False
+        self.device_label = ""
         self._force_pair = False
         self._log_path = config_dir() / "app.log"
         self._log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -655,9 +686,10 @@ class MainWindow(QMainWindow):
         self.btn_songs.setEnabled(self.connected and not self.uploading)
         self.statusBar().showMessage(f"手表上有 {len(songs)} 首歌曲")
         self.append_log("info", f"读取到手表歌曲 {len(songs)} 首")
-        WatchSongsDialog(self, songs).exec()
+        WatchSongsDialog(self, songs, device=self.device_label).exec()
 
     def _on_info(self, info: DeviceInfo) -> None:
+        self.device_label = info.model or info.name or ""
         self.chip_model.setText(f"型号 {info.model or '—'}")
         self.chip_firmware.setText(f"固件 {info.firmware or '—'}")
         self.chip_battery.setText(f"电量 {info.battery if info.battery is not None else '—'}%")

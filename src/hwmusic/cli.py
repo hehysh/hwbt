@@ -10,6 +10,7 @@ from pathlib import Path
 from . import __version__
 from .app import MusicApp
 from .session import SessionError
+from .songlist import render_song_list
 from .store import Settings
 from .transport import scan
 
@@ -85,6 +86,12 @@ async def cmd_songs(args: argparse.Namespace) -> int:
             artist = song.artist or "未知歌手"
             print(f"{song.index:3d}  {song.title} — {artist}  [{song.file_name}]")
         print(f"共 {len(songs)} 首")
+        if args.output:
+            text = render_song_list(songs, device=app.info.model or app.info.name)
+            path = Path(args.output)
+            # utf-8-sig + CRLF so Windows Notepad shows Chinese correctly.
+            path.write_text(text, encoding="utf-8-sig", newline="\r\n")
+            _log("ok", f"已导出 {len(songs)} 首到 {path}")
         return 0
     finally:
         await app.disconnect()
@@ -144,6 +151,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_info.set_defaults(func=cmd_info)
 
     p_songs = sub.add_parser("songs", help="列出手表上的歌曲")
+    p_songs.add_argument("-o", "--output", help="把歌曲列表导出为 TXT 文件")
     common(p_songs)
     p_songs.set_defaults(func=cmd_songs)
 
